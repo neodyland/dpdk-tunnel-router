@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Convenience wrapper for an in-tree build.
+set -euo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+exec "$ROOT/build/rust/release/routerctl" --socket "${ROUTERCTL_SOCKET:-$ROOT/run/ctl.sock}" "$@"

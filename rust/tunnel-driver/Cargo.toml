@@ -1,0 +1,14 @@
+[package]
+name = "tunnel-driver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Safe Rust toolkit for implementing dpdk-tunnel-router tunnel drivers"
+repository = "https://example.invalid/dpdk-tunnel-router"
+
+[lib]
+name = "tunnel_driver"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+default = []
