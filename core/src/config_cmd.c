@@ -193,6 +193,28 @@ static int set_tunnel(struct tr_config *cfg, const struct tr_config_env *env,
     return 0;
 }
 
+static int port_from_eth_name(const char *name, int nports, int *port)
+{
+    const char *p;
+    uint32_t v;
+
+    if (strncmp(name, "eth", 3) != 0)
+        return -1;
+    p = name + 3;
+    if (!*p)
+        return -1;
+    for (const char *q = p; *q; q++) {
+        if (*q < '0' || *q > '9')
+            return -1;
+    }
+    if (tr_parse_u32(p, 0, 255, &v))
+        return -1;
+    if (nports > 0 && (int)v >= nports)
+        return -1;
+    *port = (int)v;
+    return 0;
+}
+
 static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
                         int argc, char **argv, char *err, size_t errlen)
 {
@@ -208,14 +230,26 @@ static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
     if (iface && iface->kind != TR_IF_ETHERNET)
         return errf(err, errlen, "interface '%s' is not ethernet", name);
     if (!iface) {
-        if (i >= argc || strcmp(argv[i], "port") != 0)
+        int inferred = -1;
+        if (i < argc && strcmp(argv[i], "port") == 0) {
+            iface = tr_config_create(cfg, name, TR_IF_ETHERNET, err, errlen);
+            if (!iface)
+                return -1;
+        } else if (port_from_eth_name(name,
+                                      env ? env->n_ports : -1,
+                                      &inferred) == 0 &&
+                   env_port_ok(env, inferred)) {
+            /* `eth0` maps to DPDK port 0 automatically. */
+            iface = tr_config_create(cfg, name, TR_IF_ETHERNET, err, errlen);
+            if (!iface)
+                return -1;
+            iface->port_id = inferred;
+        } else {
             return errf(err, errlen,
-                        "unknown ethernet interface '%s' (create it with "
-                        "'set interfaces ethernet %s port <id>')",
+                        "unknown ethernet interface '%s' (use eth<DPDK port> "
+                        "or 'set interfaces ethernet %s port <id>')",
                         name, name);
-        iface = tr_config_create(cfg, name, TR_IF_ETHERNET, err, errlen);
-        if (!iface)
-            return -1;
+        }
     }
     target = iface;
 

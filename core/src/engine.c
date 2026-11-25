@@ -2538,7 +2538,7 @@ int tr_engine_show(struct tr_engine *e, int argc, char **argv, char **out)
             free(base);
             return -1;
         }
-        fprintf(xf, "\nRuntime IPv6 addresses (link-local / autoconf):\n");
+        bool printed_header = false;
         for (int i = 0; i < e->rt->nlocals; i++) {
             const struct tr_local_addr *l = &e->rt->locals[i];
             if (!l->linklocal && !l->dynamic)
@@ -2548,6 +2548,11 @@ int tr_engine_show(struct tr_engine *e, int argc, char **argv, char **out)
                 continue;
             if (argc >= 2 && strcmp(argv[1], iface->name) != 0)
                 continue;
+            if (!printed_header) {
+                fprintf(xf,
+                        "\nRuntime IPv6 addresses (link-local / autoconf):\n");
+                printed_header = true;
+            }
             char a[96];
             tr_ip_ntop(&l->ip, a, sizeof(a));
             fprintf(xf, "  %-16s %s/64 %s\n", iface->name, a,

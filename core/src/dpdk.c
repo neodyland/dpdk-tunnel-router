@@ -131,17 +131,23 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
         mtu = info.min_mtu;
     conf.rxmode.mtu = mtu;
     conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
-    if (nq > 1) {
+    uint64_t wanted = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP |
+                      RTE_ETH_RSS_IPV6;
+    uint64_t rss_hf = wanted & info.flow_type_rss_offloads;
+    if (nq > 1 && rss_hf != 0) {
         conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-        uint64_t wanted = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP |
-                          RTE_ETH_RSS_UDP | RTE_ETH_RSS_IPV6;
-        conf.rx_adv_conf.rss_conf.rss_hf =
-            wanted & info.flow_type_rss_offloads;
-        if (!conf.rx_adv_conf.rss_conf.rss_hf)
-            conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_IP;
+        conf.rx_adv_conf.rss_conf.rss_hf = rss_hf;
         conf.rx_adv_conf.rss_conf.rss_key = NULL;
     } else {
+        /* virtio-net and some virtual PMDs advertise multiple queues but no
+         * RSS offloads.  Requesting RSS then fails with EINVAL.  Without
+         * RSS every packet lands on queue 0, so use a single RX queue. */
         conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+        conf.rx_adv_conf.rss_conf.rss_hf = 0;
+        nq = 1;
+        d->port_nq[port] = nq;
+        fprintf(stderr,
+                "port %u: RSS unsupported by PMD; using 1 RX queue\n", port);
     }
     conf.rxmode.offloads = 0;
     conf.txmode.offloads = 0;
@@ -153,7 +159,16 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
          * conservative configuration before failing. */
         conf.rxmode.mtu = 1500;
         conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+        conf.rx_adv_conf.rss_conf.rss_hf = 0;
         ret = rte_eth_dev_configure(port, nq, nq, &conf);
+        if (ret != 0 && nq > 1) {
+            nq = 1;
+            d->port_nq[port] = 1;
+            fprintf(stderr,
+                    "port %u: multi-queue configure failed; using 1 queue\n",
+                    port);
+            ret = rte_eth_dev_configure(port, nq, nq, &conf);
+        }
         if (ret != 0) {
             snprintf(err, errlen, "port %u: configure failed: %s", port,
                      rte_strerror(-ret));

@@ -170,6 +170,21 @@ static int test_delete(void)
     return 0;
 }
 
+
+static int test_empty_show(void)
+{
+    struct tr_config cfg;
+    char *out = NULL;
+    char *argv[] = {"interfaces"};
+
+    tr_config_init(&cfg);
+    CHECK(tr_config_show(&cfg, 1, argv, &out) == 0);
+    CHECK(out != NULL);
+    CHECK(strstr(out, "No interfaces configured.") != NULL);
+    free(out);
+    return 0;
+}
+
 int main(void)
 {
     if (tr_tunnel_drivers_init()) {
@@ -180,6 +195,7 @@ int main(void)
     rc |= test_parse_and_serialize();
     rc |= test_rejections();
     rc |= test_delete();
+    rc |= test_empty_show();
     tr_tunnel_drivers_fini();
     if (rc == 0)
         printf("test_config: ok\n");

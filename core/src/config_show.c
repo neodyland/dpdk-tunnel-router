@@ -387,8 +387,11 @@ int tr_config_show(const struct tr_config *cfg, int argc, char **argv,
                 goto done;
         }
     }
+    if (sb.len == 0 && sb_appendf(&sb, "No interfaces configured.\n"))
+        goto done;
     if (!sb.data && sb_reserve(&sb, 0))
         goto done;
+    sb.data[sb.len] = '\0';
     *out = sb.data;
     sb.data = NULL;
     rc = 0;

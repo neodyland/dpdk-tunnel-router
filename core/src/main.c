@@ -156,22 +156,28 @@ static int prepare_config(struct app *a, const char *path, char *err,
         data = NULL;
     }
 
-    if (!have_file) {
+    bool any_ethernet = false;
+    for (int i = 0; i < TR_MAX_IFACES; i++) {
+        if (cfg->ifaces[i].present && cfg->ifaces[i].kind == TR_IF_ETHERNET) {
+            any_ethernet = true;
+            break;
+        }
+    }
+    /* On a fresh or Ethernet-less configuration, assign every unbound DPDK
+     * port automatically as eth0, eth1, ... .  Once at least one Ethernet
+     * interface exists, missing ports follow the saved configuration (so a
+     * deliberately deleted ethN is not resurrected). */
+    if (!have_file || !any_ethernet) {
         for (int p = 0; p < a->nports; p++) {
             char name[32];
+            if (used[p])
+                continue;
             snprintf(name, sizeof(name), "eth%d", p);
             if (tr_config_add_ethernet(cfg, name, p, NULL)) {
                 snprintf(err, errlen, "cannot create %s", name);
                 return -1;
             }
             used[p] = true;
-        }
-    } else {
-        for (int p = 0; p < a->nports; p++) {
-            if (used[p])
-                continue;
-            /* Serialized configurations list every Ethernet port.  Do not
-             * resurrect interfaces that were deliberately deleted. */
         }
     }
 
@@ -712,6 +718,18 @@ int main(int argc, char **argv)
     if (prepare_config(&app, app.config_path, err, sizeof(err))) {
         fprintf(stderr, "configuration: %s\n", err);
         goto cleanup_drivers;
+    }
+    {
+        int ethernets = 0;
+        for (int i = 0; i < TR_MAX_IFACES; i++) {
+            if (app.cfg.ifaces[i].present &&
+                app.cfg.ifaces[i].kind == TR_IF_ETHERNET)
+                ethernets++;
+        }
+        if (app.nports > 0 && ethernets == 0)
+            fprintf(stderr,
+                    "warning: no ethernet interfaces bound to DPDK ports; "
+                    "use 'set interfaces ethernet <name> port <id>'\n");
     }
 
     mp = rte_pktmbuf_pool_create("tr_pool", TR_POOL_SIZE, 256, 0,
