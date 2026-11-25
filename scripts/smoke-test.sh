@@ -116,6 +116,72 @@ if grep -q 'mtu 20' "$CONF"; then
     exit 1
 fi
 
+# Read mode must reject set/del.
+if printf 'set interfaces ethernet eth0 mtu 1400\n' |
+    "$CLI" --socket "$SOCK" --quiet >/dev/null 2>&1; then
+    echo "smoke: read mode accepted set" >&2
+    exit 1
+fi
+if ctl show interfaces | grep -q 'eth0 (ethernet, mtu 1400'; then
+    echo "smoke: read-mode set changed the router" >&2
+    exit 1
+fi
+
+# Configuration mode: candidate + save.
+printf 'configure\nset interfaces ethernet eth0 address 203.0.113.1/24\nsave\nread\n' |
+    "$CLI" --socket "$SOCK" --quiet
+ctl show interfaces | grep -q '203.0.113.1/24' || {
+    echo "smoke: candidate save did not apply" >&2
+    exit 1
+}
+
+# Configuration mode: discard must not apply.
+printf 'configure\nset interfaces ethernet eth0 address 203.0.113.2/24\ndiscard\nexit\n' |
+    "$CLI" --socket "$SOCK" --quiet
+if ctl show interfaces | grep -q '203.0.113.2/24'; then
+    echo "smoke: discarded candidate was applied" >&2
+    exit 1
+fi
+
+# Leaving configuration mode with unsaved changes must fail.
+if printf 'configure\nset interfaces ethernet eth0 address 203.0.113.3/24\nexit\n' |
+    "$CLI" --socket "$SOCK" --quiet >/dev/null 2>&1; then
+    echo "smoke: dirty candidate exit succeeded" >&2
+    exit 1
+fi
+if ctl show interfaces | grep -q '203.0.113.3/24'; then
+    echo "smoke: dirty candidate was applied" >&2
+    exit 1
+fi
+
+# --file is one configure/save transaction.
+cat >"$RUN/smoke-batch.conf" <<'BATCH'
+set interfaces ethernet eth0 address 203.0.113.4/24
+BATCH
+"$CLI" --socket "$SOCK" --quiet --file "$RUN/smoke-batch.conf"
+ctl show interfaces | grep -q '203.0.113.4/24' || {
+    echo "smoke: --file transaction did not apply" >&2
+    exit 1
+}
+
+# tcpdump-style debug capture: net_null produces frames continuously, so a
+# count-limited capture completes quickly.
+CAP="$RUN/smoke-capture.pcap"
+rm -f "$CAP"
+ctl tcpdump -i eth0 -w "$CAP" -c 20 >/dev/null
+for _ in $(seq 1 100); do
+    cap_status=$(ctl tcpdump status)
+    [[ "$cap_status" == *"packets: 20"* ]] && break
+    sleep 0.05
+done
+expect_contains "$cap_status" "packets: 20" "capture packet count"
+magic=$(od -An -tx1 -N4 "$CAP" | tr -d ' \n')
+[[ "$magic" == "d4c3b2a1" ]] || {
+    echo "smoke: capture file is not a little-endian pcap" >&2
+    exit 1
+}
+ctl tcpdump stop >/dev/null
+
 # Restart and verify persistence.
 stop_core
 start_core

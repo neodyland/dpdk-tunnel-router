@@ -19,7 +19,7 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wshadow -Wformat=2 -Wno-unused-parameter \
            -D_GNU_SOURCE -pthread -Isrc $(DPDK_CFLAGS)
 LDFLAGS += $(DPDK_LIBS) -pthread -ldl -lm
 
-.PHONY: all clean test
+.PHONY: all clean test tests
 all: $(BIN)
 
 $(OBJ)/%.o: src/%.c
@@ -37,6 +37,8 @@ $(BIN): $(OBJ)/main.o $(LIB)
 $(BUILD)/%: tests/%.c $(LIB)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+tests: $(TESTS)
 
 test: $(TESTS)
 	@mkdir -p $(ROOT)/run $(ROOT)/tmp

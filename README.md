@@ -5,8 +5,9 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
 
 - **core** (`core/`, C11 + DPDK): EAL / NIC / 論理インタフェース / ブリッジ /
   VLAN / FIB / ARP / NDP / トンネルカプセル化 / 外側フラグメントと再組み立て。
-- **routerctl** (`rust/routerctl`, Rust): 状態を持たないコマンドクライアント。
-  Unix ソケットで 1 行コマンドを送るだけです。
+- **routerctl** (`rust/routerctl`, Rust): 設定データベースを持たないコマンド
+  クライアント。read / configuration モードを持ち、Unix ソケットで 1 行
+  コマンドを送ります。candidate はコアが保持します。
 - **tunnel-driver** (`rust/tunnel-driver`, Rust): トンネルドライバーを設計する
   ための安全なライブラリ。C データプレーンから `cdylib` としてロードできます。
 
@@ -44,6 +45,7 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
 | ブリッジ | MAC 学習、フラッディング、エージング。VLAN 子インタフェースやトンネルをメンバーにできる |
 | 静的ルート | IPv4/IPv6 の最長一致FIB。再帰的な next-hop 解決に対応 |
 | 並列処理 | DPDK RSS + マルチキュー + ワーカー lcore。設定は RCU 風の不変スナップショットを rwlock で切替 |
+| デバッグキャプチャ | `tcpdump start/stop/status` で pcap を取得。物理 RX/TX、トンネル内側 RX/TX、簡易フィルタ、count/snaplen 対応 |
 | 永続化 | 正常に適用された設定だけをコアが原子的に保存。クライアントは設定ファイルを書かない |
 
 ## 2. ビルド
@@ -124,32 +126,123 @@ DPDK のポートは起動時にすべて初期化されます。初期状態で
 
 ## 5. コマンド
 
-`routerctl` はサブコマンドを解釈せず、引数を連結してコアへ送ります。設定の
-検証・適用・保存はすべてコアが行います。
+`routerctl` には **read モード**と **configuration モード**があります。
+設定の実体（candidate / running）はコアが保持し、CLI はコマンドを送るだけです。
 
-```sh
-./scripts/routerctl show status
-./scripts/routerctl set interfaces ethernet eth0 address 192.0.2.1/24
-./scripts/routerctl set interfaces tunnel tun0 remote 2001:db8:1::2
-./scripts/routerctl show configuration
-```
-
-対話モード:
+### 5.1 モード
 
 ```sh
 ./scripts/routerctl
-router# show interfaces
-router# set interfaces ethernet eth0 mtu 9000
-router# quit
+router> show status
+router> configure
+router(config)> set interfaces ethernet eth0 address 192.0.2.1/24
+router(config)> set interfaces tunnel tun0 remote 2001:db8:1::2
+router(config)> show configuration        # candidate を表示
+router(config)> save                      # 適用 + 永続化
+router(config)> exit
+router> show interfaces                   # running を表示
 ```
 
-ファイルから流し込む場合:
+- **read モード** (`router>`): `show` / `help` / `configure` / `exit`。
+  `set` / `delete` / `save` / `discard` は拒否されます。
+- **configuration モード** (`router(config)>`): `set` / `delete` / `del` で
+  candidate を編集します。`save` または `commit` で running に適用し、
+  `--config` のファイルへ原子的に保存します。`read` / `exit` / `end` で
+  read モードへ戻ります。
+- `discard` / `rollback` で candidate を running に戻します。
+- 未保存の変更がある状態で `exit` / `end` / `quit` すると拒否されます。
+  `save` するか `discard` してから抜けてください。
+- configuration モードの `show configuration` / `show interfaces` は
+  candidate を表示します。`show running-config` は現在の running を表示します。
+  `show routes` / `neighbors` / `bridge` / `statistics` などの運用表示は
+  running のデータプレーンを参照します。
+- candidate は制御セッション（Unix ソケット接続）ごとにコアが保持します。
+  切断すると未保存の candidate は破棄されます。
+- コア起動時に `--no-persist` を指定した場合、`save` は running の更新だけを
+  行い、設定ファイルは書きません。
+- 別セッションが先に `save` した場合、古い candidate の `save` は競合として
+  拒否されます。`discard` してから編集し直してください。
+
+### 5.2 ワンショット / バッチ
+
+読み取り専用のワンショット:
+
+```sh
+./scripts/routerctl show status
+./scripts/routerctl show interfaces
+```
+
+`set` / `delete` / `del` をワンショットで渡した場合は、互換性のため
+「configure → 編集 → save → exit」を 1 トランザクションとして実行します。
+
+```sh
+./scripts/routerctl set interfaces ethernet eth0 address 192.0.2.1/24
+```
+
+ファイルは 1 つの candidate トランザクションとして適用されます。途中の
+コマンドが失敗した場合は discard され、running と設定ファイルは変わりません。
 
 ```sh
 ./scripts/routerctl --file config/example.conf
 ```
 
-### 5.1 設定コマンド
+### 5.3 パケットキャプチャ (tcpdump)
+
+read モード・configuration モードのどちらからでも、デバッグ用の pcap
+キャプチャを開始できます。`tcpdump` と `capture` は同じコマンドです。
+
+```text
+tcpdump start [interface <name>|any] -w <file>
+              [-d rx|tx|both] [-s <64..16384>] [-c <count>]
+              [filter <expression>]
+tcpdump stop
+tcpdump status
+
+# start は省略可能（tcpdump 風）
+tcpdump -i <name|any> -w <file> [-d ...] [-s ...] [-c ...] [filter ...]
+```
+
+例:
+
+```sh
+# 物理ポート eth0 の RX/TX を 100 パケット取得
+./scripts/routerctl tcpdump start interface eth0 -w /tmp/eth0.pcap -c 100
+
+# トンネル tun0 の内側フレームだけを取得
+./scripts/routerctl tcpdump start interface tun0 -w /tmp/tun0.pcap -d both
+
+# TCP 443 のみ
+./scripts/routerctl tcpdump start interface any -w /tmp/tcp443.pcap \
+  filter "tcp port 443"
+
+./scripts/routerctl tcpdump status
+./scripts/routerctl tcpdump stop
+```
+
+- pcap は Ethernet (DLT_EN10MB) 形式です。`tcpdump -r` / Wireshark で読めます。
+- 取得点:
+  - 物理インタフェースの RX: 受信直後（VLAN タグを含む）
+  - VLAN 子インタフェース (`eth0.10`): タグを外した後のフレーム
+  - トンネルインタフェースの RX: 外側をデカプセルした後の内側 Ethernet
+  - トンネルインタフェースの TX: カプセル化前の内側 Ethernet
+  - 物理インタフェースの TX: カプセル化・外側フラグメント後の実際の送信フレーム
+  - `any` は上記すべて（トンネルでは外側と内側の両方）を取得します。
+- フィルタは次の語を空白区切りで AND します。`and` は省略可能です。
+  - `ip`, `ip6`, `arp`
+  - `tcp`, `udp`, `icmp`, `icmp6`
+  - `host ADDR`, `src host ADDR`, `dst host ADDR`
+  - `port N`, `src port N`, `dst port N`
+  - `vlan ID`
+  - `ether host MAC`
+  - `or` は未対応です。`filter` は行の最後に置いてください。
+- `count` に達すると自動停止します。`stop` で明示停止もできます。
+- パケットはワーカーからリングバッファ経由で main lcore がファイルへ書きます。
+  ディスク I/O はデータプレーンのワーカーをブロックしません。
+- `-w` の相対パスは `routerctl` を実行したディレクトリ基準で絶対パスに変換されます。
+  pcap を書き込むのはコアプロセスなので、コアの実行ユーザーが書き込めるパスを指定してください。
+- キャプチャ中にリングがあふれた場合は `drops` に計上されます。
+
+### 5.4 設定コマンド
 
 ```text
 set interfaces tunnel <Tunnel name> remote <IPv4 / IPv6>
@@ -214,10 +307,12 @@ show version
 help
 ```
 
-設定変更は 1 コマンド単位でトランザクション処理されます。パース・検証・
-FIB 構築・データプレーンへの反映のいずれかが失敗した場合、そのコマンドは
-適用されず、保存ファイルも変更されません。成功時はコアが
-`--config` のファイルを一時ファイル + `rename()` で原子的に更新します。
+configuration モードの `set` / `delete` は candidate だけを更新します。
+`save` / `commit` 時に、candidate の検証、FIB 構築、データプレーンへの
+一括反映、設定ファイルの原子的更新（一時ファイル + `rename()`）を行います。
+save の途中で失敗した場合は running を旧設定へ戻し、candidate は保持します。
+ワンショットの `set` / `delete` と `--file` は、この save までを自動で
+1 トランザクションとして実行します。
 
 ## 6. トンネル
 
@@ -309,9 +404,31 @@ make test
 - `test_engine`: ARP、NDP、IPv4 転送、VLAN、ブリッジ、RA/SLAAC、
   9000 byte オーバーレイを 1500 byte アンダーレイへ分割して再組み立て、
   TCP MSS clamping とチェックサム。
+- `test_capture`: pcap ヘッダ、count 自動停止、ARP フィルタ、pcap レコード。
 - Rust: EtherIP4/6 ラウンドトリップ、C ABI のレイアウトと FFI 呼び出し。
-- `scripts/smoke-test.sh`: `net_null` で実プロセスを起動し、`routerctl` で
-  設定、永続化、再起動、ホット追加、Rust プラグインのロードを確認。
+- `scripts/smoke-test.sh`: `net_null` で実プロセスを起動し、`routerctl` の
+  read / configuration モード、candidate の save / discard、未保存 exit の
+  拒否、`--file` トランザクション、pcap キャプチャ、永続化、再起動、
+  ホット追加、Rust プラグインのロードを確認。
+
+### VM で全テストを実行
+
+ホストでビルドしたテストバイナリとランタイムライブラリを initramfs に詰め、
+QEMU の VM 内で全テストを実行できます。
+
+```sh
+make vm-test
+```
+
+- QEMU / cpio / gzip が必要です。
+- `/boot/vmlinuz-$(uname -r)` が読めない場合は、同じバージョンの
+  `linux-image` パッケージを `apt-get download` してワークスペース内で
+  展開します。
+- KVM が使えない環境では TCG で起動します。
+- QEMU コンソールログは `vmtest/console.log` に残ります。
+- VM 内で `test_capture` / `test_config` / `test_engine` / `test_fib` /
+  `test_plugin` / `test_reasm`、Rust の 9 テスト、`smoke-test.sh` を
+  順に実行し、`VM_TESTS_PASS` を確認します。
 
 ## 10. 制限事項
 
@@ -330,6 +447,9 @@ make test
   返します（同じリンク上の送信元を想定）。
 - DPDK の NIC 設定（キュー、RSS、MTU 上限）は起動時に決まります。MTU は
   ソフトウェアで強制され、NIC は最大 9600 byte を受信できる設定にします。
+- pcap キャプチャはデバッグ用途です。フィルタは簡易 AND のみ（`or` 非対応）、
+  IPv6 拡張ヘッダー内の L4 ポートは解釈しません。高負荷時は `drops` が
+  増えることがあります。
 
 ## 11. ディレクトリ
 
@@ -338,6 +458,7 @@ core/                 C + DPDK データプレーン
   src/config*.c       コマンドパーサ、検証、永続化、表示
   src/engine.c        パケット処理（L2/L3/ARP/NDP/トンネル）
   src/tunnel.c        C トンネルドライバー + プラグインローダ
+  src/capture.c       tcpdump 風 pcap キャプチャ
   src/reasm.c         外側フラグメント / 再組み立て
   src/fib.c           IPv4/IPv6 LPM
   tests/

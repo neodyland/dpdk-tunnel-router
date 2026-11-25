@@ -38,22 +38,47 @@ OK <body length>\n
 `show` の出力です。サーバーは最大 8 クライアントを非ブロッキングで扱い、
 コマンド実行は main lcore 上で直列化されます。
 
-### 2.2 設定トランザクション
+### 2.2 read モード / configuration モード
 
-`set` / `delete` は次の順序で処理されます。
+制御セッション（Unix ソケット接続）ごとにコアが次を保持します。
 
-1. `tr_engine_config_copy()` で現行設定のスナップショットを取得。
-2. コピーに対してコマンドを適用。パーサは構文と値域を検証。
-3. `tr_config_validate()` でインタフェース間の整合性を検証。
-4. `tr_engine_apply()` が新しい FIB と runtime を構築。
-5. `rwlock` の write lock 下で runtime ポインタを差し替え。
-6. `tr_config_save()` が成功した場合だけ設定ファイルを更新。
-7. 保存に失敗した場合は旧設定を再適用してロールバック。
+```c
+struct cli_session {
+    bool config_mode;
+    bool dirty;
+    uint64_t base_revision;
+    struct tr_config candidate;
+};
+```
 
-パース失敗・検証失敗・FIB 構築失敗のいずれでも、現行設定とファイルは
-変更されません。
+- **read モード**: `show` / `help` / `configure` / `exit` のみ。
+  `set` / `delete` / `save` / `discard` はコアが拒否します。
+- **configuration モード**: `configure` で running のコピーを candidate として
+  取得します。`set` / `delete` / `del` は candidate のコピーに対して適用し、
+  成功した場合だけ candidate を差し替えます。running は変更しません。
+- `show configuration` / `show interfaces` は configuration モードでは
+  candidate、read モードでは running を表示します。
+  `show running-config` は常に running です。
+- `discard` / `rollback` は running から candidate を作り直します。
+- 未保存 (`dirty`) のまま `exit` / `end` / `quit` すると拒否されます。
 
-### 2.3 永続化
+### 2.3 save / commit
+
+`save` / `commit` は candidate を running に反映します。
+
+1. `base_revision` と現在の revision を比較し、別セッションの変更を検出。
+2. candidate のコピーに NIC MAC を適用し、`tr_config_validate()`。
+3. `tr_engine_apply()` が新しい FIB と runtime を構築。
+4. `rwlock` の write lock 下で runtime ポインタを差し替え。
+5. `tr_config_save()` が設定ファイルを原子的に更新。
+6. 保存に失敗した場合は旧 runtime を再適用してロールバック。
+7. 成功時に revision を進め、`dirty` を落とす。
+
+パース失敗・検証失敗・FIB 構築失敗のいずれでも running とファイルは
+変更されません。`routerctl` のワンショット `set` / `delete` と `--file` は
+configure から save までを 1 トランザクションとして実行します。
+
+### 2.4 永続化
 
 設定ファイルは「正規化された `set` コマンド列」です。起動時は次の順で
 読み込みます。
@@ -173,6 +198,28 @@ inner Ethernet
 - `local-interface` が設定されていれば ingress も一致
 
 一致しない IP protocol 97 パケットは転送せず破棄します。
+
+### 4.5 デバッグキャプチャ
+
+`tcpdump start` は pcap ライターを main lcore 側で開き、ワーカーはパケットを
+固定長スロット（512 個）へコピーして lock-free リングへ入れるだけです。
+main lcore の housekeeping がリングを drain して pcap レコードを書き、
+100 ms ごとに flush します。ディスク I/O はワーカーをブロックしません。
+
+タップ位置:
+
+| タップ | 内容 |
+| --- | --- |
+| 物理 RX | 受信直後の Ethernet フレーム（VLAN タグ含む） |
+| VLAN 子 RX/TX | タグを外した論理フレーム（親ではタグ付き） |
+| トンネル RX | 外側 IP / EtherIP を外した後の内側 Ethernet |
+| トンネル TX | カプセル化前（MSS clamp 後）の内側 Ethernet |
+| 物理 TX | カプセル化・外側フラグメント後の送信フレーム |
+
+`interface any` は全タップ、`interface eth0` などはスロット一致でフィルタ
+します。フィルタ式はワーカー側で評価し、一致したパケットだけをコピーします。
+`snaplen`、`count`、方向は開始時に固定され、停止時にリングを drain して
+pcap を close します。
 
 ## 5. 外側フラグメント
 

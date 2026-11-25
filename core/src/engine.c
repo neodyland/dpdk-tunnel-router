@@ -2,6 +2,7 @@
 
 #include "addr.h"
 #include "bridge.h"
+#include "capture.h"
 #include "config_internal.h"
 #include "fib.h"
 #include "neigh.h"
@@ -108,6 +109,7 @@ struct tr_engine {
     tr_tx_fn tx;
     void *tx_arg;
 
+    struct tr_capture *capture;
     struct tr_neigh_table neigh4;
     struct tr_neigh_table neigh6;
     struct tr_bridge_db bridges;
@@ -370,6 +372,10 @@ struct tr_engine *tr_engine_create(const struct tr_engine_params *params,
     tr_bridge_db_init(&e->bridges);
     for (int i = 0; i < TR_MAX_WORKERS; i++)
         tr_reasm_init(&e->reasm[i]);
+    if (tr_capture_create(&e->capture, err, errlen)) {
+        tr_engine_destroy(e);
+        return NULL;
+    }
 
     tr_config_init(&empty);
     if (runtime_build(e, &empty, &rt, err, errlen)) {
@@ -387,6 +393,7 @@ void tr_engine_destroy(struct tr_engine *e)
         return;
     runtime_free(e->rt);
     e->rt = NULL;
+    tr_capture_destroy(e->capture);
     tr_neigh_fini(&e->neigh4);
     tr_neigh_fini(&e->neigh6);
     tr_bridge_db_fini(&e->bridges);
@@ -603,15 +610,10 @@ static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
             rte_pktmbuf_free(m);
         return;
     }
-    if (iface->kind == TR_IF_VLAN && !pkt_tagged(m)) {
-        if (pkt_add_vlan(m, (uint16_t)iface->vlan_id)) {
-            stats_drop(e, worker, if_slot);
-            rte_pktmbuf_free(m);
-            return;
-        }
-    }
-    maxlen = iface->mtu + ETH_HLEN + (pkt_tagged(m) ? 4 : 0);
-    if (mlen(m) > maxlen) {
+    bool will_tag = iface->kind == TR_IF_VLAN && !pkt_tagged(m);
+    uint32_t final_len = mlen(m) + (will_tag ? 4 : 0);
+    maxlen = iface->mtu + ETH_HLEN + ((pkt_tagged(m) || will_tag) ? 4 : 0);
+    if (final_len > maxlen) {
         stats_drop(e, worker, if_slot);
         rte_pktmbuf_free(m);
         return;
@@ -620,6 +622,19 @@ static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
         stats_drop(e, worker, if_slot);
         rte_pktmbuf_free(m);
         return;
+    }
+    if (iface->kind == TR_IF_VLAN) {
+        /* Logical VLAN tap: untagged inner frame, like tcpdump on eth0.10. */
+        tr_capture_tap_exact(e->capture, if_slot, TR_CAP_TX, m);
+        if (will_tag && pkt_add_vlan(m, (uint16_t)iface->vlan_id)) {
+            stats_drop(e, worker, if_slot);
+            rte_pktmbuf_free(m);
+            return;
+        }
+        /* Physical parent tap: tagged frame on the wire. */
+        tr_capture_tap(e->capture, iface->parent, TR_CAP_TX, m);
+    } else {
+        tr_capture_tap(e->capture, if_slot, TR_CAP_TX, m);
     }
     stats_tx(e, worker, if_slot, mlen(m));
     e->tx(e->tx_arg, worker, if_slot, m);
@@ -1288,6 +1303,7 @@ static void tunnel_send(struct tr_engine *e, int worker,
     }
 
     mss_clamp_frame(e, worker, rt, t, under_slot, m);
+    tr_capture_tap(e->capture, if_slot, TR_CAP_TX, m);
 
     memset(&flow, 0, sizeof(flow));
     flow.family = t->family;
@@ -1425,6 +1441,7 @@ static void process_outer(struct tr_engine *e, int worker,
     if (if_slot_stats_valid(e, worker, tslot))
         atomic_fetch_add_explicit(&e->stats[tslot][worker].reasm_ok, 1,
                                   memory_order_relaxed);
+    tr_capture_tap(e->capture, tslot, TR_CAP_RX, m);
     engine_input_slot(e, worker, rt, tslot, m);
 }
 
@@ -2084,6 +2101,8 @@ static void engine_input_slot(struct tr_engine *e, int worker,
             }
             if_slot = vlan->slot;
             iface = vlan;
+            /* Logical VLAN tap: untagged frame selected by the tag. */
+            tr_capture_tap_exact(e->capture, if_slot, TR_CAP_RX, m);
         }
     }
     if (iface->bridge >= 0)
@@ -2103,6 +2122,7 @@ int tr_engine_input(struct tr_engine *e, int worker, int if_slot,
         rte_pktmbuf_free(m);
         return -1;
     }
+    tr_capture_tap(e->capture, if_slot, TR_CAP_RX, m);
     pthread_rwlock_rdlock(&e->rt_lock);
     rt = e->rt;
     stats_rx(e, worker, if_slot, mlen(m));
@@ -2267,6 +2287,7 @@ void tr_engine_housekeeping(struct tr_engine *e, uint64_t now_ms)
     bool dirty;
     uint64_t now = now_ms ? now_ms : tr_monotonic_ms();
 
+    tr_capture_poll(e->capture);
     tr_neigh_expire(&e->neigh4, now);
     tr_neigh_expire(&e->neigh6, now);
     tr_bridge_expire(&e->bridges, now);
@@ -2544,4 +2565,56 @@ int tr_engine_show(struct tr_engine *e, int argc, char **argv, char **out)
         return 0;
     }
     return -1;
+}
+
+int tr_engine_capture_start(struct tr_engine *e, const char *ifname,
+                            const char *file, unsigned direction,
+                            uint32_t snaplen, uint64_t count,
+                            const char *filter, char *err, size_t errlen)
+{
+    int slot = -1;
+    char name[TR_CAP_IFNAME_LEN];
+    const struct tr_iface *iface = NULL;
+
+    if (!e || !e->capture) {
+        snprintf(err, errlen, "capture is unavailable");
+        return -1;
+    }
+    snprintf(name, sizeof(name), "%s",
+             ifname && *ifname ? ifname : "any");
+    if (strcmp(name, "any") != 0) {
+        pthread_rwlock_rdlock(&e->rt_lock);
+        iface = tr_config_find_const(&e->rt->cfg, name);
+        if (!iface) {
+            pthread_rwlock_unlock(&e->rt_lock);
+            snprintf(err, errlen, "unknown interface '%s'", name);
+            return -1;
+        }
+        if (iface->kind == TR_IF_BRIDGE) {
+            pthread_rwlock_unlock(&e->rt_lock);
+            snprintf(err, errlen,
+                     "capture a bridge member, not the bridge itself");
+            return -1;
+        }
+        slot = iface->slot;
+        pthread_rwlock_unlock(&e->rt_lock);
+    }
+    return tr_capture_start(e->capture, slot, name, file, direction, snaplen,
+                            count, filter, err, errlen);
+}
+
+int tr_engine_capture_stop(struct tr_engine *e, char *err, size_t errlen)
+{
+    if (!e || !e->capture) {
+        snprintf(err, errlen, "capture is unavailable");
+        return -1;
+    }
+    return tr_capture_stop(e->capture, err, errlen);
+}
+
+int tr_engine_capture_status(struct tr_engine *e, char **out)
+{
+    if (!e || !e->capture)
+        return -1;
+    return tr_capture_status_text(e->capture, out);
 }

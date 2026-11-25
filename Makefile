@@ -9,7 +9,7 @@ ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 CARGO := $(ROOT)/scripts/cargo.sh
 BUILD := $(ROOT)/build
 
-.PHONY: all core rust rust-lib cli test core-test rust-test smoke clean install
+.PHONY: all core rust rust-lib cli test core-test rust-test smoke vm-test clean install
 .PHONY: distclean
 
 all: core rust
@@ -37,6 +37,9 @@ test: core-test rust-test smoke
 smoke: all
 	./scripts/smoke-test.sh
 
+vm-test: all
+	./tests/vm/run-vm-tests.sh
+
 install: all
 	install -D -m 0755 $(BUILD)/core/dpdk-tunnel-router $(DESTDIR)/usr/local/sbin/dpdk-tunnel-router
 	install -D -m 0755 $(BUILD)/rust/release/routerctl $(DESTDIR)/usr/local/bin/routerctl
@@ -45,7 +48,7 @@ install: all
 
 clean:
 	$(MAKE) -C core clean
-	rm -rf $(BUILD) run tmp
+	rm -rf $(BUILD) run tmp vmtest
 	mkdir -p run tmp
 
 distclean: clean

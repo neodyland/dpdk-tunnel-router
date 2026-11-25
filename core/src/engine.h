@@ -55,4 +55,12 @@ void tr_engine_send_router_solicitations(struct tr_engine *e);
 
 int tr_engine_stats_text(struct tr_engine *e, char **out);
 
+/* Debug packet capture (pcap) */
+int tr_engine_capture_start(struct tr_engine *e, const char *ifname,
+                            const char *file, unsigned direction,
+                            uint32_t snaplen, uint64_t count,
+                            const char *filter, char *err, size_t errlen);
+int tr_engine_capture_stop(struct tr_engine *e, char *err, size_t errlen);
+int tr_engine_capture_status(struct tr_engine *e, char **out);
+
 #endif

@@ -1,4 +1,5 @@
 #include "config.h"
+#include "capture.h"
 #include "config_internal.h"
 #include "control.h"
 #include "dpdk.h"
@@ -37,6 +38,14 @@ struct app {
     int workers;
     int nports;
     bool persist;
+    uint64_t revision;
+};
+
+struct cli_session {
+    bool config_mode;
+    bool dirty;
+    uint64_t base_revision;
+    struct tr_config candidate;
 };
 
 static volatile sig_atomic_t g_stop;
@@ -176,150 +185,450 @@ static int prepare_config(struct app *a, const char *path, char *err,
     return 0;
 }
 
-static const char *help_text(void)
+static const char *help_text(bool config_mode)
 {
-    return "Commands:\n"
-           "  set interfaces tunnel <name> remote <ipv4|ipv6>\n"
-           "  set interfaces tunnel <name> local-address <ipv4|ipv6>\n"
-           "  set interfaces tunnel <name> local-interface <ifname>\n"
-           "  set interfaces tunnel <name> mtu <68..9000>\n"
-           "  set interfaces tunnel <name> encapsulation "
-           "<etherip6|etherip|...>\n"
-           "  set interfaces tunnel <name> tcp-mss <auto|none|N>\n"
-           "  set interfaces tunnel <name> address "
-           "<prefix|ipv6 autoconf>\n"
-           "  set interfaces ethernet <name> port <dpdk-port>\n"
-           "  set interfaces ethernet <name> address <prefix>\n"
-           "  set interfaces ethernet <name> mtu <68..9000>\n"
-           "  set interfaces ethernet <name> vlan-id <1..4094> "
-           "address <prefix>\n"
-           "  set interfaces ethernet <name> vlan-id <1..4094> mtu <N>\n"
-           "  set interfaces bridge <name> children <ifname>\n"
-           "  set interfaces bridge <name> mtu <68..9000>\n"
+    if (!config_mode)
+        return "Read mode commands:\n"
+               "  show configuration | interfaces [name] | routes | neighbors\n"
+               "  show bridge | statistics | tunnels | drivers | status | version\n"
+               "  configure          enter configuration mode\n"
+               "  tcpdump start|stop|status   packet capture (pcap)\n"
+               "  help | exit | quit\n"
+               "\n"
+               "Configuration changes require configuration mode.\n";
+    return "Configuration mode commands:\n"
+           "  set interfaces tunnel <name> ...\n"
+           "  set interfaces ethernet <name> ...\n"
+           "  set interfaces bridge <name> ...\n"
            "  set protocols static route <prefix> via <next-hop>\n"
-           "  delete ...   (same paths, delete interfaces/routes/children)\n"
-           "  show configuration | interfaces [name] | routes | neighbors\n"
-           "  show bridge | statistics | tunnels | drivers | status\n"
-           "  commit | help | quit\n";
+           "  delete ... / del ...\n"
+           "  show configuration | interfaces [name]   (candidate)\n"
+           "  show running-config                     (active configuration)\n"
+           "  show routes | neighbors | bridge | statistics | tunnels | drivers\n"
+           "  save | commit       apply candidate and persist it\n"
+           "  discard | rollback  discard candidate changes\n"
+           "  tcpdump start|stop|status   packet capture (pcap)\n"
+           "  read | exit | end   return to read mode\n"
+           "  help | quit\n"
+           "\n"
+           "save/commit is required before exiting with pending changes.\n";
 }
 
-static int control_execute(void *arg, const char *line, char **body,
-                           char **error_text)
+static int fail_msg(char **error_text, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    if (vasprintf(error_text, fmt, ap) < 0)
+        *error_text = NULL;
+    va_end(ap);
+    return -1;
+}
+
+static int body_msg(char **body, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    if (vasprintf(body, fmt, ap) < 0)
+        *body = NULL;
+    va_end(ap);
+    return *body ? 0 : -1;
+}
+
+static void *control_session_open(void *arg)
 {
     struct app *a = arg;
-    char *copy = strdup(line);
+    struct cli_session *s = calloc(1, sizeof(*s));
+
+    if (!s)
+        return NULL;
+    if (tr_engine_config_copy(a->engine, &s->candidate)) {
+        free(s);
+        return NULL;
+    }
+    s->base_revision = a->revision;
+    return s;
+}
+
+static void control_session_close(void *arg, void *session)
+{
+    (void)arg;
+    free(session);
+}
+
+static int reset_candidate(struct app *a, struct cli_session *s, char **error_text)
+{
+    if (tr_engine_config_copy(a->engine, &s->candidate))
+        return fail_msg(error_text, "cannot read running configuration\n");
+    s->base_revision = a->revision;
+    s->dirty = false;
+    return 0;
+}
+
+static int show_running(struct app *a, int argc, char **argv, char **body)
+{
+    if (argc >= 2 && strcmp(argv[1], "version") == 0) {
+        if (asprintf(body, "dpdk-tunnel-router %s (DPDK %s)\n", TR_VERSION,
+                     rte_version()) < 0)
+            return -1;
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "status") == 0) {
+        char *status = NULL;
+        if (tr_dpdk_status_text(a->dpdk, &status))
+            return -1;
+        int rc = asprintf(body,
+                          "dpdk-tunnel-router %s\n%s"
+                          "tunnel drivers: %d registered\n",
+                          TR_VERSION, status, tr_tunnel_driver_count());
+        free(status);
+        return rc < 0 ? -1 : 0;
+    }
+    if (argc >= 2 && (strcmp(argv[1], "configuration") == 0 ||
+                      strcmp(argv[1], "running-config") == 0)) {
+        if (strcmp(argv[1], "running-config") == 0)
+            argv[1] = "configuration";
+        return tr_engine_show(a->engine, argc - 1, argv + 1, body);
+    }
+    if (argc >= 2)
+        return tr_engine_show(a->engine, argc - 1, argv + 1, body);
+    return -1;
+}
+
+static int show_candidate(struct app *a, struct cli_session *s, int argc,
+                          char **argv, char **body)
+{
+    if (argc >= 2 && (strcmp(argv[1], "configuration") == 0 ||
+                      strcmp(argv[1], "candidate-config") == 0)) {
+        return tr_config_serialize(&s->candidate, body);
+    }
+    if (argc >= 2 && strcmp(argv[1], "interfaces") == 0) {
+        int rc = tr_config_show(&s->candidate, argc - 1, argv + 1, body);
+        return rc;
+    }
+    if (argc >= 2 && strcmp(argv[1], "running-config") == 0)
+        return show_running(a, argc, argv, body);
+    /* Operational tables (FIB, neighbors, counters) describe the running
+     * data plane; the candidate is not installed until save/commit. */
+    return show_running(a, argc, argv, body);
+}
+
+static int edit_candidate(struct app *a, struct cli_session *s, int argc,
+                          char **argv, char **body, char **error_text)
+{
+    struct tr_config working;
+    char err[512];
+
+    tr_config_copy(&working, &s->candidate);
+    if (tr_config_apply(&working, &a->env, argc, argv, err, sizeof(err)))
+        return fail_msg(error_text, "%s\n", err[0] ? err : "configuration error");
+    apply_port_macs(&working, a->nports);
+    if (tr_config_validate(&working, &a->env, err, sizeof(err)))
+        return fail_msg(error_text, "%s\n", err[0] ? err : "configuration error");
+    tr_config_copy(&s->candidate, &working);
+    s->dirty = true;
+    return body_msg(body, "Candidate updated.\n");
+}
+
+static int commit_candidate(struct app *a, struct cli_session *s, char **body,
+                            char **error_text)
+{
+    struct tr_config working, old;
+    char err[512];
+    char save_err[256];
+
+    if (!s->dirty)
+        return body_msg(body, "No changes to save.\n");
+    if (s->base_revision != a->revision) {
+        return fail_msg(error_text,
+                        "running configuration changed in another session; "
+                        "use 'discard' and re-enter configuration mode\n");
+    }
+    tr_config_copy(&working, &s->candidate);
+    apply_port_macs(&working, a->nports);
+    if (tr_config_validate(&working, &a->env, err, sizeof(err)))
+        return fail_msg(error_text, "%s\n", err[0] ? err : "configuration error");
+    if (tr_engine_config_copy(a->engine, &old))
+        return fail_msg(error_text, "cannot read running configuration\n");
+    if (tr_engine_apply(a->engine, &working, err, sizeof(err)))
+        return fail_msg(error_text, "%s\n", err[0] ? err : "apply failed");
+    tr_dpdk_refresh(a->dpdk);
+    if (a->persist &&
+        tr_config_save(&working, a->config_path, save_err, sizeof(save_err))) {
+        tr_engine_apply(a->engine, &old, err, sizeof(err));
+        tr_dpdk_refresh(a->dpdk);
+        return fail_msg(error_text, "cannot save configuration: %s\n",
+                        save_err);
+    }
+    a->revision++;
+    s->base_revision = a->revision;
+    s->dirty = false;
+    tr_config_copy(&s->candidate, &working);
+    if (a->persist)
+        return body_msg(body, "Configuration saved.\n");
+    return body_msg(body, "Configuration applied (persistence disabled).\n");
+}
+
+static int capture_command(struct app *a, int argc, char **argv, char **body,
+                           char **error_text)
+{
+    const char *sub = argc >= 2 ? argv[1] : "status";
+    char err[512];
+
+    if (strcmp(sub, "help") == 0 || strcmp(sub, "-h") == 0 ||
+        strcmp(sub, "--help") == 0) {
+        return body_msg(body,
+                        "tcpdump start [interface <name>|any] -w <file>\n"
+                        "              [-d rx|tx|both] [-s snaplen] [-c count]\n"
+                        "              [filter <ip|ip6|arp|tcp|udp|icmp|icmp6|"
+                        "host ADDR|src host ADDR|dst host ADDR|port N|"
+                        "src port N|dst port N|vlan ID>]\n"
+                        "tcpdump stop\n"
+                        "tcpdump status\n"
+                        "tcpdump -i <if> -w <file> ...   (start may be omitted)\n");
+    }
+    bool start_mode =
+        strcmp(sub, "start") == 0 || strcmp(sub, "interface") == 0 ||
+        strcmp(sub, "file") == 0 || strcmp(sub, "output") == 0 ||
+        strcmp(sub, "direction") == 0 || strcmp(sub, "snaplen") == 0 ||
+        strcmp(sub, "count") == 0 || strcmp(sub, "filter") == 0 ||
+        strcmp(sub, "expression") == 0 || sub[0] == '-';
+    if (start_mode) {
+        const char *ifname = "any";
+        const char *file = NULL;
+        char filter_buf[TR_CAP_FILTER_LEN];
+        const char *filter = "";
+        unsigned direction = TR_CAP_BOTH;
+        uint32_t snaplen = TR_CAP_SNAPLEN_MAX;
+        uint64_t count = 0;
+        int i = strcmp(sub, "start") == 0 ? 2 : 1;
+
+        filter_buf[0] = '\0';
+
+        while (i < argc) {
+            const char *opt = argv[i++];
+            if (strcmp(opt, "interface") == 0 || strcmp(opt, "-i") == 0) {
+                if (i >= argc)
+                    return fail_msg(error_text, "%s requires a name\n", opt);
+                ifname = argv[i++];
+            } else if (strcmp(opt, "file") == 0 ||
+                       strcmp(opt, "output") == 0 ||
+                       strcmp(opt, "-w") == 0) {
+                if (i >= argc)
+                    return fail_msg(error_text, "%s requires a path\n", opt);
+                file = argv[i++];
+            } else if (strcmp(opt, "direction") == 0 ||
+                       strcmp(opt, "-d") == 0) {
+                if (i >= argc)
+                    return fail_msg(error_text,
+                                    "direction requires rx/tx/both\n");
+                if (strcmp(argv[i], "rx") == 0)
+                    direction = TR_CAP_RX;
+                else if (strcmp(argv[i], "tx") == 0)
+                    direction = TR_CAP_TX;
+                else if (strcmp(argv[i], "both") == 0)
+                    direction = TR_CAP_BOTH;
+                else
+                    return fail_msg(error_text,
+                                    "direction must be rx, tx, or both\n");
+                i++;
+            } else if (strcmp(opt, "snaplen") == 0 ||
+                       strcmp(opt, "-s") == 0) {
+                uint32_t v;
+                if (i >= argc ||
+                    tr_parse_u32(argv[i], 64, TR_CAP_SNAPLEN_MAX, &v))
+                    return fail_msg(error_text,
+                                    "snaplen must be 64..%d\n",
+                                    TR_CAP_SNAPLEN_MAX);
+                snaplen = v;
+                i++;
+            } else if (strcmp(opt, "count") == 0 ||
+                       strcmp(opt, "-c") == 0) {
+                uint32_t v;
+                if (i >= argc ||
+                    tr_parse_u32(argv[i], 0, 1000000000u, &v))
+                    return fail_msg(error_text,
+                                    "count must be 0..1000000000\n");
+                count = v;
+                i++;
+            } else if (strcmp(opt, "filter") == 0 ||
+                       strcmp(opt, "expression") == 0) {
+                size_t off = 0;
+                for (; i < argc; i++) {
+                    int n = snprintf(filter_buf + off,
+                                     sizeof(filter_buf) - off, "%s%s",
+                                     off ? " " : "", argv[i]);
+                    if (n < 0 || (size_t)n >= sizeof(filter_buf) - off)
+                        return fail_msg(error_text,
+                                        "capture filter is too long\n");
+                    off += (size_t)n;
+                }
+                filter = filter_buf;
+                break;
+            } else {
+                return fail_msg(error_text, "unknown capture option '%s'\n",
+                                opt);
+            }
+        }
+        if (!file)
+            return fail_msg(error_text, "capture file is required (-w FILE)\n");
+        if (tr_engine_capture_start(a->engine, ifname, file, direction,
+                                    snaplen, count, filter, err, sizeof(err)))
+            return fail_msg(error_text, "%s\n", err);
+        char *status = NULL;
+        if (tr_engine_capture_status(a->engine, &status) == 0) {
+            int rc = asprintf(body, "Capture started.\n%s", status);
+            free(status);
+            return rc < 0 ? -1 : 0;
+        }
+        return body_msg(body, "Capture started.\n");
+    }
+    if (strcmp(sub, "stop") == 0) {
+        if (tr_engine_capture_stop(a->engine, err, sizeof(err)))
+            return fail_msg(error_text, "%s\n", err);
+        char *status = NULL;
+        if (tr_engine_capture_status(a->engine, &status) == 0) {
+            int rc = asprintf(body, "Capture stopped.\n%s", status);
+            free(status);
+            return rc < 0 ? -1 : 0;
+        }
+        return body_msg(body, "Capture stopped.\n");
+    }
+    if (strcmp(sub, "status") == 0 || strcmp(sub, "show") == 0) {
+        if (tr_engine_capture_status(a->engine, body))
+            return fail_msg(error_text, "capture status unavailable\n");
+        return 0;
+    }
+    return fail_msg(error_text, "unknown tcpdump command '%s'\n", sub);
+}
+
+static int control_execute(void *arg, void *session, const char *line,
+                           char **body, char **error_text)
+{
+    struct app *a = arg;
+    struct cli_session *s = session;
+    char *copy;
     char *argv[64];
     int argc;
-    char err[512];
     int rc = 0;
 
-    if (!copy) {
-        *error_text = strdup("out of memory\n");
-        return -1;
-    }
+    *body = NULL;
+    *error_text = NULL;
+    if (!s)
+        return fail_msg(error_text, "control session unavailable\n");
+    copy = strdup(line);
+    if (!copy)
+        return fail_msg(error_text, "out of memory\n");
     argc = tr_split(copy, argv, (int)TR_ARRAY_SIZE(argv));
     if (argc == 0) {
         free(copy);
-        *body = strdup("");
-        return 0;
+        return body_msg(body, "");
     }
-    err[0] = '\0';
-    if (strcmp(argv[0], "show") == 0) {
-        if (argc >= 2 && strcmp(argv[1], "version") == 0) {
-            if (asprintf(body, "dpdk-tunnel-router %s (DPDK %s)\n",
-                         TR_VERSION, rte_version()) < 0)
-                rc = -1;
-        } else if (argc >= 2 && strcmp(argv[1], "status") == 0) {
-            char *status = NULL;
-            if (tr_dpdk_status_text(a->dpdk, &status) == 0) {
-                if (asprintf(body,
-                             "dpdk-tunnel-router %s\n%s"
-                             "tunnel drivers: %d registered\n",
-                             TR_VERSION, status, tr_tunnel_driver_count()) < 0)
-                    rc = -1;
-                free(status);
-            } else {
-                rc = -1;
-            }
-        } else if (argc >= 2 && (strcmp(argv[1], "configuration") == 0 ||
-                                 strcmp(argv[1], "running-config") == 0)) {
-            if (strcmp(argv[1], "running-config") == 0)
-                argv[1] = "configuration";
-            rc = tr_engine_show(a->engine, argc - 1, argv + 1, body);
-        } else if (argc >= 2) {
-            rc = tr_engine_show(a->engine, argc - 1, argv + 1, body);
+    if (strcmp(argv[0], "del") == 0)
+        argv[0] = "delete";
+
+    if (strcmp(argv[0], "configure") == 0 || strcmp(argv[0], "config") == 0) {
+        if (s->config_mode) {
+            rc = fail_msg(error_text, "already in configuration mode\n");
+        } else if (reset_candidate(a, s, error_text)) {
+            rc = -1;
         } else {
-            rc = -1;
+            s->config_mode = true;
+            rc = body_msg(body, "Entering configuration mode.\n");
         }
-        if (rc) {
-            *error_text = strdup("unknown or failed show command\n");
-        }
-    } else if (strcmp(argv[0], "set") == 0 ||
-               strcmp(argv[0], "delete") == 0) {
-        struct tr_config working, old;
-        if (tr_engine_config_copy(a->engine, &old)) {
-            *error_text = strdup("cannot read running configuration\n");
-            rc = -1;
-            goto out;
-        }
-        tr_config_copy(&working, &old);
-        if (tr_config_apply(&working, &a->env, argc, argv, err,
-                            sizeof(err))) {
-            *error_text = strdup(err[0] ? err : "configuration error");
-            if (*error_text) {
-                size_t n = strlen(*error_text);
-                *error_text = realloc(*error_text, n + 2);
-                if (*error_text) {
-                    (*error_text)[n] = '\n';
-                    (*error_text)[n + 1] = '\0';
-                }
-            }
-            rc = -1;
-            goto out;
-        }
-        apply_port_macs(&working, a->nports);
-        if (tr_config_validate(&working, &a->env, err, sizeof(err))) {
-            if (asprintf(error_text, "%s\n", err) < 0)
-                *error_text = NULL;
-            rc = -1;
-            goto out;
-        }
-        if (tr_engine_apply(a->engine, &working, err, sizeof(err))) {
-            if (asprintf(error_text, "%s\n", err) < 0)
-                *error_text = NULL;
-            rc = -1;
-            goto out;
-        }
-        tr_dpdk_refresh(a->dpdk);
-        if (a->persist) {
-            char save_err[256];
-            if (tr_config_save(&working, a->config_path, save_err,
-                               sizeof(save_err))) {
-                /* Roll back to keep disk and data plane consistent. */
-                tr_engine_apply(a->engine, &old, err, sizeof(err));
-                tr_dpdk_refresh(a->dpdk);
-                if (asprintf(error_text, "applied but not persisted: %s\n",
-                             save_err) < 0)
-                    *error_text = NULL;
-                rc = -1;
-                goto out;
-            }
-        }
-        if (asprintf(body, "Committed.\n") < 0)
-            rc = -1;
-    } else if (strcmp(argv[0], "commit") == 0) {
-        *body = strdup("Committed.\n");
-    } else if (strcmp(argv[0], "help") == 0) {
-        *body = strdup(help_text());
-    } else if (strcmp(argv[0], "quit") == 0 ||
-               strcmp(argv[0], "exit") == 0) {
-        *body = strdup("Bye.\n");
-    } else {
-        if (asprintf(error_text, "unknown command '%s' (try 'help')\n",
-                     argv[0]) < 0)
-            *error_text = NULL;
-        rc = -1;
+        goto out;
     }
+    if (strcmp(argv[0], "read") == 0) {
+        if (!s->config_mode) {
+            rc = body_msg(body, "Already in read mode.\n");
+        } else if (s->dirty) {
+            rc = fail_msg(error_text,
+                          "unsaved changes; use 'save' or 'discard' first\n");
+        } else {
+            s->config_mode = false;
+            rc = body_msg(body, "Read mode.\n");
+        }
+        goto out;
+    }
+    if (strcmp(argv[0], "exit") == 0 || strcmp(argv[0], "end") == 0) {
+        if (!s->config_mode) {
+            rc = body_msg(body, "Bye.\n");
+        } else if (s->dirty) {
+            rc = fail_msg(error_text,
+                          "unsaved changes; use 'save' or 'discard' first\n");
+        } else {
+            s->config_mode = false;
+            rc = body_msg(body, "Exiting configuration mode.\n");
+        }
+        goto out;
+    }
+    if (strcmp(argv[0], "save") == 0 || strcmp(argv[0], "commit") == 0) {
+        if (!s->config_mode)
+            rc = fail_msg(error_text,
+                          "save is only available in configuration mode\n");
+        else
+            rc = commit_candidate(a, s, body, error_text);
+        goto out;
+    }
+    if (strcmp(argv[0], "discard") == 0 ||
+        strcmp(argv[0], "rollback") == 0) {
+        if (!s->config_mode) {
+            rc = fail_msg(error_text,
+                          "discard is only available in configuration mode\n");
+        } else if (reset_candidate(a, s, error_text)) {
+            rc = -1;
+        } else {
+            rc = body_msg(body, "Candidate discarded.\n");
+        }
+        goto out;
+    }
+    if (strcmp(argv[0], "set") == 0 || strcmp(argv[0], "delete") == 0) {
+        if (!s->config_mode) {
+            rc = fail_msg(error_text,
+                          "%s is only available in configuration mode; "
+                          "enter 'configure' first\n",
+                          argv[0]);
+        } else {
+            rc = edit_candidate(a, s, argc, argv, body, error_text);
+        }
+        goto out;
+    }
+    if (strcmp(argv[0], "show") == 0) {
+        if (argc < 2) {
+            rc = fail_msg(error_text, "show requires a topic\n");
+        } else if (s->config_mode &&
+                   (strcmp(argv[1], "configuration") == 0 ||
+                    strcmp(argv[1], "candidate-config") == 0 ||
+                    strcmp(argv[1], "interfaces") == 0)) {
+            rc = show_candidate(a, s, argc, argv, body);
+        } else {
+            rc = show_running(a, argc, argv, body);
+        }
+        if (rc)
+            rc = fail_msg(error_text, "unknown or failed show command\n");
+        goto out;
+    }
+    if (strcmp(argv[0], "tcpdump") == 0 ||
+        strcmp(argv[0], "capture") == 0) {
+        rc = capture_command(a, argc, argv, body, error_text);
+        goto out;
+    }
+    if (strcmp(argv[0], "help") == 0) {
+        rc = body_msg(body, "%s", help_text(s->config_mode));
+        goto out;
+    }
+    if (strcmp(argv[0], "quit") == 0) {
+        if (s->config_mode && s->dirty) {
+            rc = fail_msg(error_text,
+                          "unsaved changes; use 'save' or 'discard' first\n");
+        } else {
+            s->config_mode = false;
+            rc = body_msg(body, "Bye.\n");
+        }
+        goto out;
+    }
+    rc = fail_msg(error_text, "unknown command '%s' (try 'help')\n", argv[0]);
 out:
     free(copy);
     return rc;
@@ -446,7 +755,11 @@ int main(int argc, char **argv)
         goto cleanup_dpdk;
     }
 
-    struct tr_control_ops ops = {.execute = control_execute};
+    struct tr_control_ops ops = {
+        .session_open = control_session_open,
+        .session_close = control_session_close,
+        .execute = control_execute,
+    };
     app.control = tr_control_create(app.sock_path, &ops, &app, err,
                                     sizeof(err));
     if (!app.control) {

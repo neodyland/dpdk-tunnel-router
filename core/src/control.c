@@ -19,6 +19,7 @@
 
 struct ctrl_client {
     int fd;
+    void *session;
     char in[CTRL_IN_MAX];
     size_t in_len;
     char *out;
@@ -35,10 +36,12 @@ struct tr_control {
     int nclients;
 };
 
-static void client_close(struct ctrl_client *c)
+static void client_close(struct tr_control *ctrl, struct ctrl_client *c)
 {
     if (c->fd >= 0)
         close(c->fd);
+    if (c->session && ctrl->ops->session_close)
+        ctrl->ops->session_close(ctrl->arg, c->session);
     free(c->out);
     memset(c, 0, sizeof(*c));
     c->fd = -1;
@@ -86,7 +89,8 @@ static void execute_line(struct tr_control *ctrl, struct ctrl_client *c,
         respond(c, 0, "command too long\n");
         return;
     }
-    if (ctrl->ops->execute(ctrl->arg, trimmed, &body, &errtext) == 0) {
+    if (ctrl->ops->execute(ctrl->arg, c->session, trimmed, &body, &errtext) ==
+        0) {
         respond(c, 1, body ? body : "");
     } else {
         respond(c, 0, errtext ? errtext : "command failed\n");
@@ -101,7 +105,7 @@ static void client_read(struct tr_control *ctrl, struct ctrl_client *c)
     ssize_t n = read(c->fd, buf, sizeof(buf));
 
     if (n <= 0) {
-        client_close(c);
+        client_close(ctrl, c);
         return;
     }
     if (c->in_len + (size_t)n >= sizeof(c->in)) {
@@ -123,7 +127,7 @@ static void client_read(struct tr_control *ctrl, struct ctrl_client *c)
     }
 }
 
-static void client_write(struct ctrl_client *c)
+static void client_write(struct tr_control *ctrl, struct ctrl_client *c)
 {
     if (c->out_off >= c->out_len) {
         c->out_len = 0;
@@ -138,7 +142,7 @@ static void client_write(struct ctrl_client *c)
             c->out_len = 0;
         }
     } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        client_close(c);
+        client_close(ctrl, c);
     }
 }
 
@@ -242,6 +246,9 @@ void tr_control_poll(struct tr_control *c, int timeout_ms)
             }
             memset(&c->clients[slot], 0, sizeof(c->clients[slot]));
             c->clients[slot].fd = cfd;
+            if (c->ops->session_open)
+                c->clients[slot].session =
+                    c->ops->session_open(c->arg);
         }
     }
     for (int i = 1; i < n; i++) {
@@ -251,13 +258,13 @@ void tr_control_poll(struct tr_control *c, int timeout_ms)
         if (cl->fd < 0)
             continue;
         if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            client_close(cl);
+            client_close(c, cl);
             continue;
         }
         if (pfds[i].revents & POLLIN)
             client_read(c, cl);
         if (cl->fd >= 0 && (pfds[i].revents & POLLOUT))
-            client_write(cl);
+            client_write(c, cl);
     }
 }
 
@@ -266,7 +273,7 @@ void tr_control_destroy(struct tr_control *c)
     if (!c)
         return;
     for (int i = 0; i < CTRL_MAX_CLIENTS; i++)
-        client_close(&c->clients[i]);
+        client_close(c, &c->clients[i]);
     if (c->listen_fd >= 0)
         close(c->listen_fd);
     if (c->path[0])
