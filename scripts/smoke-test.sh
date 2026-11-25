@@ -199,6 +199,15 @@ ifaces=$(ctl show interfaces)
 expect_contains "$ifaces" "wan1 (ethernet, mtu 1500" "hot-added ethernet"
 stop_core
 
+# An existing but Ethernet-less config file must still auto-assign all DPDK
+# ports as eth0, eth1, ...
+printf '# no interfaces configured yet\n' >"$CONF"
+start_core
+auto_ifaces=$(ctl show interfaces)
+expect_contains "$auto_ifaces" "eth0 (ethernet" "automatic port 0 assignment"
+expect_contains "$auto_ifaces" "eth1 (ethernet" "automatic port 1 assignment"
+stop_core
+
 # Load the Rust cdylib and confirm its two drivers are visible.
 if [[ -f "$PLUGIN" ]]; then
     start_core --plugin "$PLUGIN"

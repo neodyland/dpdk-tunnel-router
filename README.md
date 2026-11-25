@@ -117,9 +117,16 @@ sudo ./build/core/dpdk-tunnel-router \
   --ctl-sock /run/dpdk-tunnel-router.sock
 ```
 
-DPDK のポートは起動時にすべて初期化されます。初期状態では `eth0`, `eth1`, …
-が DPDK port 0, 1, … に自動で割り当てられます。設定ファイルが存在する場合は
-その `set interfaces ethernet <name> port <id>` に従います。
+DPDK のポートは起動時にすべて初期化されます。Ethernet インタフェースが
+1 つもない設定（初回起動やコメントだけの設定ファイル）では、`eth0`, `eth1`, …
+が DPDK port 0, 1, … に自動で割り当てられます。既に Ethernet インタフェースが
+ある場合は、保存された `set interfaces ethernet <name> port <id>` に従います。
+`eth<N>` という名前は DPDK port N に自動対応するため、次のコマンドだけでも
+インタフェースを作成できます。
+
+```sh
+./scripts/routerctl set interfaces ethernet eth0 address 192.0.2.1/24
+```
 
 > DPDK は NIC をカーネルから取り上げます。Linux の `ip link` には論理
 > インタフェースは現れません。`routerctl show interfaces` で確認してください。
@@ -267,6 +274,9 @@ set protocols static route <IPv4/IPv6 prefix> via <same-family next-hop>
 
 補足:
 
+- `set interfaces ethernet eth0 ...` のように `eth<N>` を指定すると、未作成でも
+  DPDK port N に自動で割り当てて作成します。任意名を使う場合は
+  `set interfaces ethernet <name> port <id>` で明示してください。
 - `address` は CIDR を受け付けます。ホストビットは保持されます
   （`192.0.2.1/24` はそのまま。FIB に入る connected route は
   `192.0.2.0/24`）。

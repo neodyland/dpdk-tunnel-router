@@ -185,6 +185,34 @@ static int test_empty_show(void)
     return 0;
 }
 
+
+static int test_auto_eth(void)
+{
+    struct tr_config cfg;
+    struct tr_config_env env;
+    char *out = NULL;
+    char *argv[] = {"interfaces"};
+    char err[256];
+
+    tr_config_init(&cfg);
+    env.n_ports = 2;
+    env.port_valid = NULL;
+    env.port_names = NULL;
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth1 address 198.51.100.1/24") == 0);
+    const struct tr_iface *eth1 = tr_config_find_const(&cfg, "eth1");
+    CHECK(eth1 != NULL);
+    CHECK(eth1->port_id == 1);
+    CHECK(eth1->naddrs == 1);
+    CHECK(test_apply(&cfg, &env,
+                     "set interfaces ethernet eth2 address 203.0.113.1/24",
+                     err, sizeof(err)) != 0);
+    CHECK(tr_config_show(&cfg, 1, argv, &out) == 0);
+    CHECK(out != NULL && strstr(out, "eth1 (ethernet") != NULL);
+    free(out);
+    return 0;
+}
+
 int main(void)
 {
     if (tr_tunnel_drivers_init()) {
@@ -196,6 +224,7 @@ int main(void)
     rc |= test_rejections();
     rc |= test_delete();
     rc |= test_empty_show();
+    rc |= test_auto_eth();
     tr_tunnel_drivers_fini();
     if (rc == 0)
         printf("test_config: ok\n");

@@ -85,7 +85,9 @@ configure から save までを 1 トランザクションとして実行しま�
 
 1. 設定ファイルをプリスキャンし、`set interfaces ethernet <name> port <id>`
    から物理ポートの名前を先に確保。
-2. 設定ファイルが存在しない場合だけ `eth0`, `eth1`, … を自動作成。
+2. 設定ファイルが存在しない場合、または Ethernet インタフェースが 1 つも
+   無い場合は `eth0`, `eth1`, … を自動作成。既に Ethernet がある場合は
+   保存された `port` 割り当てに従う（`eth<N>` はコマンド実行時に自動割り当て）。
 3. 全行を `tr_config_apply()` で適用。
 4. NIC の MAC を Ethernet にコピーし、VLAN 子へ継承。
 5. 最終検証後、runtime を構築。
