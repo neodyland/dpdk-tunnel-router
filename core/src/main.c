@@ -1,5 +1,6 @@
 #include "config.h"
 #include "capture.h"
+#include "help.h"
 #include "config_internal.h"
 #include "control.h"
 #include "dpdk.h"
@@ -38,6 +39,7 @@ struct app {
     int workers;
     int nports;
     bool persist;
+    bool allow_no_ports;
     uint64_t revision;
 };
 
@@ -226,35 +228,6 @@ static int prepare_config(struct app *a, const char *path, char *err,
     if (tr_config_validate(cfg, &a->env, err, errlen))
         return -1;
     return 0;
-}
-
-static const char *help_text(bool config_mode)
-{
-    if (!config_mode)
-        return "Read mode commands:\n"
-               "  show configuration | interfaces [name] | routes | neighbors\n"
-               "  show bridge | statistics | tunnels | drivers | status | version\n"
-               "  configure          enter configuration mode\n"
-               "  tcpdump start|stop|status   packet capture (pcap)\n"
-               "  help | exit | quit\n"
-               "\n"
-               "Configuration changes require configuration mode.\n";
-    return "Configuration mode commands:\n"
-           "  set interfaces tunnel <name> ...\n"
-           "  set interfaces ethernet <name> ...\n"
-           "  set interfaces bridge <name> ...\n"
-           "  set protocols static route <prefix> via <next-hop>\n"
-           "  delete ... / del ...\n"
-           "  show configuration | interfaces [name]   (candidate)\n"
-           "  show running-config                     (active configuration)\n"
-           "  show routes | neighbors | bridge | statistics | tunnels | drivers\n"
-           "  save | commit       apply candidate and persist it\n"
-           "  discard | rollback  discard candidate changes\n"
-           "  tcpdump start|stop|status   packet capture (pcap)\n"
-           "  read | exit | end   return to read mode\n"
-           "  help | quit\n"
-           "\n"
-           "save/commit is required before exiting with pending changes.\n";
 }
 
 static int fail_msg(char **error_text, const char *fmt, ...)
@@ -571,6 +544,59 @@ static int control_execute(void *arg, void *session, const char *line,
     if (strcmp(argv[0], "del") == 0)
         argv[0] = "delete";
 
+    /* Context help: "? " at the end of a command, "?" alone, or
+     * "help <path>".  A question mark attached to the last token is also
+     * accepted (e.g. "eth1?"). */
+    bool help_request = false;
+    char *help_argv[64];
+    int help_argc = 0;
+    if (strcmp(argv[0], "help") == 0) {
+        help_request = true;
+        for (int i = 1; i < argc && help_argc < 64; i++)
+            help_argv[help_argc++] = argv[i];
+    } else {
+        char *last = argv[argc - 1];
+        size_t last_len = strlen(last);
+        if (strcmp(last, "?") == 0) {
+            help_request = true;
+            for (int i = 0; i < argc - 1 && help_argc < 64; i++)
+                help_argv[help_argc++] = argv[i];
+        } else if (last_len > 1 && last[last_len - 1] == '?') {
+            last[last_len - 1] = '\0';
+            help_request = true;
+            for (int i = 0; i < argc && help_argc < 64; i++)
+                help_argv[help_argc++] = argv[i];
+        }
+    }
+    if (help_request) {
+        if (help_argc > 0) {
+            char *last = help_argv[help_argc - 1];
+            size_t n = strlen(last);
+            if (strcmp(last, "?") == 0)
+                help_argc--;
+            else if (n > 1 && last[n - 1] == '?')
+                last[n - 1] = '\0';
+        }
+        struct tr_config snapshot;
+        const struct tr_config *hcfg;
+        if (s->config_mode) {
+            hcfg = &s->candidate;
+        } else {
+            if (tr_engine_config_copy(a->engine, &snapshot)) {
+                rc = fail_msg(error_text, "cannot read running "
+                                           "configuration\n");
+                goto out;
+            }
+            hcfg = &snapshot;
+        }
+        if (tr_help_command(hcfg, a->nports, s->config_mode, help_argc,
+                            help_argv, body))
+            rc = fail_msg(error_text, "help unavailable\n");
+        else
+            rc = 0;
+        goto out;
+    }
+
     if (strcmp(argv[0], "configure") == 0 || strcmp(argv[0], "config") == 0) {
         if (s->config_mode) {
             rc = fail_msg(error_text, "already in configuration mode\n");
@@ -657,10 +683,6 @@ static int control_execute(void *arg, void *session, const char *line,
         rc = capture_command(a, argc, argv, body, error_text);
         goto out;
     }
-    if (strcmp(argv[0], "help") == 0) {
-        rc = body_msg(body, "%s", help_text(s->config_mode));
-        goto out;
-    }
     if (strcmp(argv[0], "quit") == 0) {
         if (s->config_mode && s->dirty) {
             rc = fail_msg(error_text,
@@ -686,7 +708,8 @@ static void usage(const char *prog)
             "  --ctl-sock PATH     control socket (default run/ctl.sock)\n"
             "  --workers N         worker lcores (default 1)\n"
             "  --plugin PATH       load a Rust tunnel-driver .so\n"
-            "  --no-persist        do not write the running configuration\n",
+            "  --no-persist        do not write the running configuration\n"
+            "  --allow-no-ports    start the control plane with zero DPDK ports\n",
             prog);
 }
 
@@ -704,6 +727,7 @@ int main(int argc, char **argv)
     snprintf(app.sock_path, sizeof(app.sock_path), "run/ctl.sock");
     app.workers = 1;
     app.persist = true;
+    app.allow_no_ports = false;
 
     eal_ret = rte_eal_init(argc, argv);
     if (eal_ret < 0) {
@@ -736,6 +760,8 @@ int main(int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--no-persist") == 0) {
             app.persist = false;
+        } else if (strcmp(argv[i], "--allow-no-ports") == 0) {
+            app.allow_no_ports = true;
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
@@ -752,6 +778,16 @@ int main(int argc, char **argv)
     app.nports = (int)rte_eth_dev_count_avail();
     if (app.nports > 256)
         app.nports = 256;
+    if (app.nports == 0 && !app.allow_no_ports) {
+        fprintf(stderr,
+                "error: EAL found no usable DPDK ports.\n"
+                "  check: sudo dpdk-devbind.py --status\n"
+                "         lspci -k -s <PCI address>\n"
+                "         cat /sys/module/vfio/parameters/"
+                "enable_unsafe_noiommu_mode\n"
+                "  for a control-only instance use --allow-no-ports\n");
+        goto cleanup_drivers;
+    }
     if (prepare_config(&app, app.config_path, err, sizeof(err))) {
         fprintf(stderr, "configuration: %s\n", err);
         goto cleanup_drivers;

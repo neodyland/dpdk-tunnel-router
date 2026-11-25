@@ -106,6 +106,15 @@ expect_contains "$conf" "set interfaces bridge br0 children eth0.20" "bridge chi
 status=$(ctl show status)
 expect_contains "$status" "workers 1" "status"
 
+# Context-sensitive help.
+help_root=$(ctl '?')
+expect_contains "$help_root" "command help" "root help"
+help_eth=$(ctl set interfaces ethernet eth1 '?')
+expect_contains "$help_eth" "Ethernet eth1" "ethernet context help"
+expect_contains "$help_eth" "vlan-id" "ethernet property help"
+help_show=$(ctl show '?')
+expect_contains "$help_show" "show configuration" "show help"
+
 # A rejected command must return non-zero and leave the configuration intact.
 if ctl set interfaces ethernet eth0 mtu 20 >/dev/null 2>&1; then
     echo "smoke: invalid MTU was accepted" >&2

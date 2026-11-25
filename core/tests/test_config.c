@@ -1,5 +1,7 @@
 #include "test_common.h"
 
+#include "help.h"
+
 #include <stdlib.h>
 
 static const char *commands[] = {
@@ -213,6 +215,40 @@ static int test_auto_eth(void)
     return 0;
 }
 
+
+static int test_help(void)
+{
+    struct tr_config cfg;
+    struct tr_config_env env;
+    char *out = NULL;
+    char *set_argv[] = {"set", "interfaces", "ethernet", "eth1"};
+    char *show_argv[] = {"show"};
+    char *cap_argv[] = {"tcpdump"};
+    char err[256];
+
+    tr_config_init(&cfg);
+    env.n_ports = 2;
+    env.port_valid = NULL;
+    env.port_names = NULL;
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth1 address "
+                        "198.51.100.1/24") == 0);
+    CHECK(tr_help_command(&cfg, 2, true, 4, set_argv, &out) == 0);
+    CHECK(out != NULL && strstr(out, "Ethernet eth1") != NULL);
+    CHECK(strstr(out, "vlan-id") != NULL);
+    free(out);
+    out = NULL;
+    CHECK(tr_help_command(&cfg, 2, false, 1, show_argv, &out) == 0);
+    CHECK(out != NULL && strstr(out, "show configuration") != NULL);
+    free(out);
+    out = NULL;
+    CHECK(tr_help_command(&cfg, 2, false, 1, cap_argv, &out) == 0);
+    CHECK(out != NULL && strstr(out, "tcpdump start") != NULL);
+    free(out);
+    (void)err;
+    return 0;
+}
+
 int main(void)
 {
     if (tr_tunnel_drivers_init()) {
@@ -225,6 +261,7 @@ int main(void)
     rc |= test_delete();
     rc |= test_empty_show();
     rc |= test_auto_eth();
+    rc |= test_help();
     tr_tunnel_drivers_fini();
     if (rc == 0)
         printf("test_config: ok\n");

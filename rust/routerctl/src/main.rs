@@ -11,6 +11,7 @@
 //! modes explicitly.
 
 use std::env;
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -47,6 +48,12 @@ fn usage(prog: &str) {
          accepts set, delete/del, save/commit, discard/rollback, show and\n\
          read/exit.  Exiting with unsaved changes is refused; use save or\n\
          discard first.\n\
+         \n\
+         Context help: end a command with ? or use 'help <path>'.\n\
+         \x20 {prog} set interfaces ethernet eth1 '?'\n\
+         \n\
+         Interactive line editing: Up/Down history, Left/Right/Home/End,\n\
+         Backspace/Delete, Ctrl-L clear, Ctrl-C cancel, Ctrl-D EOF.\n\
          \n\
          Debug capture (available in both modes):\n\
          \x20 {prog} tcpdump start interface eth0 -w /tmp/eth0.pcap -c 100\n\
@@ -248,6 +255,14 @@ fn is_edit_command(line: &str) -> bool {
     matches!(first_word(line), "set" | "delete" | "del")
 }
 
+fn is_help_command(line: &str) -> bool {
+    if first_word(line) == "help" {
+        return true;
+    }
+    let last = line.split_whitespace().last().unwrap_or("");
+    last == "?" || (last.len() > 1 && last.ends_with('?'))
+}
+
 fn is_mode_command(line: &str) -> bool {
     matches!(
         first_word(line),
@@ -334,24 +349,366 @@ fn read_file_commands(path: &PathBuf) -> Result<Vec<String>, String> {
     Ok(commands)
 }
 
+// ---------------------------------------------------------------------------
+// Small terminal line editor
+//
+// We deliberately avoid an external crate.  The interactive shell only needs
+// history navigation (Up/Down) and basic cursor editing, so a compact Linux
+// termios implementation is enough.
+// ---------------------------------------------------------------------------
+
+const TCSANOW: i32 = 0;
+const ICANON: u32 = 0o000002;
+const ECHO: u32 = 0o000010;
+const ECHOE: u32 = 0o000020;
+const ECHOK: u32 = 0o000040;
+const ECHONL: u32 = 0o000100;
+const ISIG: u32 = 0o000001;
+const IEXTEN: u32 = 0o100000;
+const VMIN: usize = 6;
+const VTIME: usize = 5;
+const POLLIN: i16 = 0x0001;
+const HISTORY_MAX: usize = 500;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; 32],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+extern "C" {
+    fn isatty(fd: i32) -> i32;
+    fn tcgetattr(fd: i32, termios: *mut Termios) -> i32;
+    fn tcsetattr(fd: i32, action: i32, termios: *const Termios) -> i32;
+    fn read(fd: i32, buf: *mut c_void, count: usize) -> isize;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+}
+
+struct RawTerminal {
+    original: Termios,
+}
+
+impl RawTerminal {
+    fn new() -> io::Result<Self> {
+        unsafe {
+            if isatty(0) != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "stdin is not a terminal",
+                ));
+            }
+            let mut original: Termios = std::mem::zeroed();
+            if tcgetattr(0, &mut original) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut raw = original;
+            raw.c_lflag &= !(ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHONL | IEXTEN);
+            raw.c_cc[VMIN] = 1;
+            raw.c_cc[VTIME] = 0;
+            if tcsetattr(0, TCSANOW, &raw) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { original })
+        }
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = tcsetattr(0, TCSANOW, &self.original);
+        }
+    }
+}
+
+fn read_byte() -> io::Result<Option<u8>> {
+    loop {
+        let mut b = 0u8;
+        let n = unsafe { read(0, &mut b as *mut u8 as *mut c_void, 1) };
+        if n == 1 {
+            return Ok(Some(b));
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(e);
+    }
+}
+
+fn input_ready(timeout_ms: i32) -> bool {
+    let mut p = PollFd {
+        fd: 0,
+        events: POLLIN,
+        revents: 0,
+    };
+    unsafe { poll(&mut p, 1, timeout_ms) > 0 && (p.revents & POLLIN) != 0 }
+}
+
+enum Key {
+    Char(char),
+    Enter,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    CtrlC,
+    CtrlD,
+    CtrlL,
+    Unknown,
+}
+
+fn read_key() -> io::Result<Option<Key>> {
+    let Some(b) = read_byte()? else {
+        return Ok(None);
+    };
+    let key = match b {
+        0x03 => Key::CtrlC,
+        0x04 => Key::CtrlD,
+        0x0c => Key::CtrlL,
+        b'\r' | b'\n' => Key::Enter,
+        0x7f | 0x08 => Key::Backspace,
+        0x1b => {
+            if !input_ready(25) {
+                Key::Unknown
+            } else {
+                let Some(b1) = read_byte()? else {
+                    return Ok(None);
+                };
+                if b1 != b'[' && b1 != b'O' {
+                    Key::Unknown
+                } else {
+                    let Some(b2) = read_byte()? else {
+                        return Ok(None);
+                    };
+                    match b2 {
+                        b'A' => Key::Up,
+                        b'B' => Key::Down,
+                        b'C' => Key::Right,
+                        b'D' => Key::Left,
+                        b'H' => Key::Home,
+                        b'F' => Key::End,
+                        b'3' => {
+                            let _ = read_byte()?; // consume '~'
+                            Key::Delete
+                        }
+                        b'1' | b'7' => {
+                            let _ = read_byte()?; // consume '~'
+                            Key::Home
+                        }
+                        b'4' | b'8' => {
+                            let _ = read_byte()?; // consume '~'
+                            Key::End
+                        }
+                        _ => Key::Unknown,
+                    }
+                }
+            }
+        }
+        c if c >= 0x20 && c < 0x7f => Key::Char(c as char),
+        _ => Key::Unknown,
+    };
+    Ok(Some(key))
+}
+
+fn render_line(prompt: &str, chars: &[char], cursor: usize) -> io::Result<()> {
+    let mut out = io::stdout();
+    write!(out, "\r\x1b[K{prompt}")?;
+    for c in chars {
+        write!(out, "{c}")?;
+    }
+    let tail = chars.len() - cursor;
+    if tail > 0 {
+        write!(out, "\x1b[{tail}D")?;
+    }
+    out.flush()
+}
+
+fn history_push(history: &mut Vec<String>, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    if history.last().map(|s| s == line).unwrap_or(false) {
+        return;
+    }
+    history.push(line.to_string());
+    if history.len() > HISTORY_MAX {
+        history.remove(0);
+    }
+}
+
+fn read_line_raw(prompt: &str, history: &mut Vec<String>) -> io::Result<Option<String>> {
+    let mut chars: Vec<char> = Vec::new();
+    let mut cursor = 0usize;
+    let mut hist_index: Option<usize> = None;
+    let mut draft = String::new();
+    render_line(prompt, &chars, cursor)?;
+    loop {
+        let Some(key) = read_key()? else {
+            write!(io::stdout(), "\r\n")?;
+            return Ok(None);
+        };
+        match key {
+            Key::Enter => {
+                write!(io::stdout(), "\r\n")?;
+                let line: String = chars.iter().collect();
+                history_push(history, &line);
+                return Ok(Some(line));
+            }
+            Key::CtrlC => {
+                write!(io::stdout(), "^C\r\n")?;
+                return Ok(Some(String::new()));
+            }
+            Key::CtrlD => {
+                if chars.is_empty() {
+                    write!(io::stdout(), "\r\n")?;
+                    return Ok(None);
+                }
+                if cursor < chars.len() {
+                    chars.remove(cursor);
+                }
+                hist_index = None;
+            }
+            Key::CtrlL => {
+                write!(io::stdout(), "\x1b[2J\x1b[H")?;
+            }
+            Key::Char(c) => {
+                chars.insert(cursor, c);
+                cursor += 1;
+                hist_index = None;
+            }
+            Key::Backspace => {
+                if cursor > 0 {
+                    chars.remove(cursor - 1);
+                    cursor -= 1;
+                }
+                hist_index = None;
+            }
+            Key::Delete => {
+                if cursor < chars.len() {
+                    chars.remove(cursor);
+                }
+                hist_index = None;
+            }
+            Key::Left => {
+                if cursor > 0 {
+                    cursor -= 1;
+                }
+            }
+            Key::Right => {
+                if cursor < chars.len() {
+                    cursor += 1;
+                }
+            }
+            Key::Home => {
+                cursor = 0;
+            }
+            Key::End => {
+                cursor = chars.len();
+            }
+            Key::Up => {
+                if !history.is_empty() {
+                    match hist_index {
+                        None => {
+                            draft = chars.iter().collect();
+                            hist_index = Some(history.len() - 1);
+                        }
+                        Some(i) if i > 0 => hist_index = Some(i - 1),
+                        Some(_) => {}
+                    }
+                    if let Some(i) = hist_index {
+                        chars = history[i].chars().collect();
+                        cursor = chars.len();
+                    }
+                }
+            }
+            Key::Down => match hist_index {
+                Some(i) if i + 1 < history.len() => {
+                    hist_index = Some(i + 1);
+                    chars = history[i + 1].chars().collect();
+                    cursor = chars.len();
+                }
+                Some(_) => {
+                    hist_index = None;
+                    chars = draft.chars().collect();
+                    cursor = chars.len();
+                }
+                None => {}
+            },
+            Key::Unknown => {}
+        }
+        render_line(prompt, &chars, cursor)?;
+    }
+}
+
+struct LineEditor {
+    raw: Option<RawTerminal>,
+}
+
+impl LineEditor {
+    fn new() -> Self {
+        let raw = if io::stdin().is_terminal() {
+            RawTerminal::new().ok()
+        } else {
+            None
+        };
+        Self { raw }
+    }
+
+    fn read_line(&self, prompt: &str, history: &mut Vec<String>) -> io::Result<Option<String>> {
+        if self.raw.is_some() {
+            return read_line_raw(prompt, history);
+        }
+        print!("{prompt}");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        let n = io::stdin().read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(line))
+    }
+}
+
 fn interactive(client: &mut Client, quiet: bool) -> bool {
-    let stdin = io::stdin();
     let mut mode = Mode::Read;
     let mut ok = true;
+    let mut history: Vec<String> = Vec::new();
+    let editor = LineEditor::new();
     loop {
-        print!(
-            "{}",
-            match mode {
-                Mode::Read => "router> ",
-                Mode::Config => "router(config)> ",
+        let prompt = match mode {
+            Mode::Read => "router> ",
+            Mode::Config => "router(config)> ",
+        };
+        let line = match editor.read_line(prompt, &mut history) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("routerctl: {e}");
+                break;
             }
-        );
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -483,7 +840,7 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(2);
         }
-        if is_edit_command(&command) {
+        if is_edit_command(&command) && !is_help_command(&command) {
             return if run_transaction(&mut client, &[command], args.quiet) {
                 ExitCode::SUCCESS
             } else {
@@ -522,5 +879,27 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn termios_layout_is_linux_x86_64() {
+        assert_eq!(std::mem::size_of::<Termios>(), 60);
+    }
+
+    #[test]
+    fn history_push_deduplicates_and_caps() {
+        let mut h = Vec::new();
+        history_push(&mut h, "show status");
+        history_push(&mut h, "show status");
+        assert_eq!(h.len(), 1);
+        for i in 0..(HISTORY_MAX + 10) {
+            history_push(&mut h, &format!("cmd {i}"));
+        }
+        assert_eq!(h.len(), HISTORY_MAX);
     }
 }

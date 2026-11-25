@@ -132,6 +132,51 @@ DPDK のポートは起動時にすべて初期化されます。Ethernet イン
 > DPDK は NIC をカーネルから取り上げます。Linux の `ip link` には論理
 > インタフェースは現れません。`routerctl show interfaces` で確認してください。
 
+### 4.1 DPDK ポートの初期化に失敗する場合
+
+次のようなログは、EAL が PCI デバイスを見つけたものの、DPDK がそのデバイスを
+初期化できなかったことを示します。
+
+```text
+eth_virtio_pci_init(): Failed to init PCI device
+EAL: Requested device 0000:06:13.0 cannot be used
+...
+dpdk-tunnel-router: 0 ports
+```
+
+確認と復旧:
+
+```sh
+# 1. 古い DPDK プロセスがデバイスを掴んでいないか
+sudo pgrep -af dpdk-tunnel-router
+sudo pkill -f dpdk-tunnel-router
+sudo lsof /dev/vfio/* 2>/dev/null || true
+
+# 2. デバイスのドライバを確認
+sudo dpdk-devbind.py --status
+lspci -k -s 0000:06:13.0
+
+# 3. カーネルドライバ (virtio-pci) から vfio-pci へ戻す
+sudo modprobe vfio-pci
+sudo dpdk-devbind.py --bind=vfio-pci 0000:06:13.0 0000:06:14.0
+
+# 4. IOMMU が無い環境では no-IOMMU を許可する
+cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+sudo sh -c 'echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode'
+
+# 5. 再起動
+sudo ./run.sh
+```
+
+`enable_unsafe_noiommu_mode` は IOMMU なしで VFIO を使うための設定で、
+セキュリティ上の制約があります。可能なら IOMMU を有効化してください。
+
+ポートが 1 つも取れない場合、コアは設定変更だけ可能な制御プレーンとして起動
+できます。
+
+コア起動オプション（`--` の後）に `--allow-no-ports` を追加してください。
+`run.sh` を使う場合は、その行に追記します。
+
 ## 5. コマンド
 
 `routerctl` には **read モード**と **configuration モード**があります。
@@ -150,6 +195,10 @@ router(config)> save                      # 適用 + 永続化
 router(config)> exit
 router> show interfaces                   # running を表示
 ```
+
+対話モードでは上下キーでコマンド履歴、左右キー / Home / End でカーソル移動、
+Backspace / Delete で編集できます。Ctrl-L で画面クリア、Ctrl-C で入力中の
+行をキャンセル、Ctrl-D で終了します。履歴は CLI セッション内で保持されます。
 
 - **read モード** (`router>`): `show` / `help` / `configure` / `exit`。
   `set` / `delete` / `save` / `discard` は拒否されます。
@@ -325,6 +374,39 @@ save の途中で失敗した場合は running を旧設定へ戻し、candidate
 ワンショットの `set` / `delete` と `--file` は、この save までを自動で
 1 トランザクションとして実行します。
 
+### 5.5 コンテキストヘルプ
+
+`?` をコマンドの末尾に付けると、その位置で使える構文・現在値・例を表示します。
+
+```text
+router> ?
+router> set ?
+router> set interfaces ?
+router> set interfaces ethernet eth1 ?
+router> set interfaces ethernet eth1 address ?
+router> set interfaces tunnel tun0 ?
+router> set protocols static route ?
+router> show ?
+router> tcpdump ?
+```
+
+`help <path>` でも同じ内容を表示できます。
+
+```text
+router> help set interfaces ethernet eth1
+```
+
+configuration モードでは candidate の現在値を、read モードでは running の
+現在値を表示します。
+
+シェルからワンショットで渡す場合、`?` はシェルのワイルドカードなので
+クォートしてください。
+
+```sh
+./scripts/routerctl set interfaces ethernet eth1 '?'
+./scripts/routerctl '?'
+```
+
 ## 6. トンネル
 
 ### 6.1 EtherIP6 / EtherIP
@@ -475,6 +557,7 @@ core/                 C + DPDK データプレーン
   src/engine.c        パケット処理（L2/L3/ARP/NDP/トンネル）
   src/tunnel.c        C トンネルドライバー + プラグインローダ
   src/capture.c       tcpdump 風 pcap キャプチャ
+  src/help.c          コンテキストヘルプ
   src/reasm.c         外側フラグメント / 再組み立て
   src/fib.c           IPv4/IPv6 LPM
   tests/
