@@ -121,6 +121,7 @@ DPDK のポートは起動時にすべて初期化されます。Ethernet イン
 1 つもない設定（初回起動やコメントだけの設定ファイル）では、`eth0`, `eth1`, …
 が DPDK port 0, 1, … に自動で割り当てられます。既に Ethernet インタフェースが
 ある場合は、保存された `set interfaces ethernet <name> port <id>` に従います。
+自動作成時は起動ログに `auto-port: eth0 = DPDK port 0` のように表示されます。
 `eth<N>` という名前は DPDK port N に自動対応するため、次のコマンドだけでも
 インタフェースを作成できます。
 

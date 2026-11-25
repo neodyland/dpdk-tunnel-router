@@ -102,13 +102,47 @@ static void apply_port_macs(struct tr_config *cfg, int nports)
     }
 }
 
+static int auto_assign_unbound_ports(struct tr_config *cfg, int nports,
+                                     char *err, size_t errlen)
+{
+    bool used[256] = {false};
+    int made = 0;
+
+    for (int i = 0; i < TR_MAX_IFACES; i++) {
+        const struct tr_iface *iface = &cfg->ifaces[i];
+        if (iface->present && iface->kind == TR_IF_ETHERNET &&
+            iface->port_id >= 0 && iface->port_id < 256)
+            used[iface->port_id] = true;
+    }
+    for (int p = 0; p < nports; p++) {
+        if (used[p])
+            continue;
+        char name[32];
+        snprintf(name, sizeof(name), "eth%d", p);
+        if (tr_config_find(cfg, name)) {
+            snprintf(err, errlen,
+                     "cannot auto-assign DPDK port %d: interface '%s' exists",
+                     p, name);
+            return -1;
+        }
+        if (tr_config_add_ethernet(cfg, name, p, NULL)) {
+            snprintf(err, errlen, "cannot auto-create %s", name);
+            return -1;
+        }
+        fprintf(stderr, "auto-port: %s = DPDK port %d\n", name, p);
+        used[p] = true;
+        made++;
+    }
+    (void)made;
+    return 0;
+}
+
 static int prepare_config(struct app *a, const char *path, char *err,
                           size_t errlen)
 {
     char *data = NULL;
     size_t len = 0;
     bool have_file = false;
-    bool used[256] = {false};
     struct tr_config *cfg = &a->cfg;
 
     tr_config_init(cfg);
@@ -149,7 +183,6 @@ static int prepare_config(struct app *a, const char *path, char *err,
                     return -1;
                 }
                 iface->port_id = (int)port;
-                used[port] = true;
             }
         }
         free(data);
@@ -167,22 +200,26 @@ static int prepare_config(struct app *a, const char *path, char *err,
      * port automatically as eth0, eth1, ... .  Once at least one Ethernet
      * interface exists, missing ports follow the saved configuration (so a
      * deliberately deleted ethN is not resurrected). */
-    if (!have_file || !any_ethernet) {
-        for (int p = 0; p < a->nports; p++) {
-            char name[32];
-            if (used[p])
-                continue;
-            snprintf(name, sizeof(name), "eth%d", p);
-            if (tr_config_add_ethernet(cfg, name, p, NULL)) {
-                snprintf(err, errlen, "cannot create %s", name);
-                return -1;
-            }
-            used[p] = true;
-        }
-    }
+    if ((!have_file || !any_ethernet) &&
+        auto_assign_unbound_ports(cfg, a->nports, err, errlen))
+        return -1;
 
     if (have_file &&
         tr_config_load(cfg, &a->env, path, err, errlen))
+        return -1;
+
+    /* The config may explicitly delete every Ethernet interface, or may
+     * contain only tunnels/bridges.  Re-check after loading and make sure
+     * every unbound DPDK port still has a logical eth<N>. */
+    bool still_has_ethernet = false;
+    for (int i = 0; i < TR_MAX_IFACES; i++) {
+        if (cfg->ifaces[i].present && cfg->ifaces[i].kind == TR_IF_ETHERNET) {
+            still_has_ethernet = true;
+            break;
+        }
+    }
+    if (!still_has_ethernet &&
+        auto_assign_unbound_ports(cfg, a->nports, err, errlen))
         return -1;
 
     apply_port_macs(cfg, a->nports);
@@ -726,7 +763,11 @@ int main(int argc, char **argv)
                 app.cfg.ifaces[i].kind == TR_IF_ETHERNET)
                 ethernets++;
         }
-        if (app.nports > 0 && ethernets == 0)
+        if (app.nports == 0)
+            fprintf(stderr,
+                    "warning: no DPDK ports enumerated; check -a / "
+                    "dpdk-devbind\n");
+        else if (ethernets == 0)
             fprintf(stderr,
                     "warning: no ethernet interfaces bound to DPDK ports; "
                     "use 'set interfaces ethernet <name> port <id>'\n");

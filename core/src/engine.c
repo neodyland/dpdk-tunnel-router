@@ -2560,7 +2560,14 @@ int tr_engine_show(struct tr_engine *e, int argc, char **argv, char **out)
         }
         pthread_rwlock_unlock(&e->rt_lock);
         fclose(xf);
-        if (asprintf(out, "%s%s", base ? base : "", extra ? extra : "") < 0) {
+        char note[160] = "";
+        if (base && strstr(base, "No interfaces configured."))
+            snprintf(note, sizeof(note),
+                     "DPDK ports detected: %d. Check the startup log "
+                     "(auto-port/warning lines).\n",
+                     e->n_ports);
+        if (asprintf(out, "%s%s%s", base ? base : "", extra ? extra : "",
+                     note) < 0) {
             free(base);
             free(extra);
             return -1;
