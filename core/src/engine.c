@@ -111,6 +111,16 @@ struct tr_ra_event {
     uint32_t mtu;
 };
 
+#define TR_VLAN_MAP_SIZE 512
+#define TR_TUNNEL_HASH_SIZE 256
+
+struct tr_vlan_map_entry {
+    int parent;
+    uint16_t vid;
+    int16_t child;
+    bool used;
+};
+
 struct tr_runtime {
     uint64_t generation;
     struct tr_config cfg;
@@ -118,17 +128,24 @@ struct tr_runtime {
     struct tr_tunnel_rt tunnel[TR_MAX_IFACES];
     struct tr_local_addr locals[TR_LOCAL_MAX];
     int nlocals;
+    struct tr_vlan_map_entry vlan_map[TR_VLAN_MAP_SIZE];
+    int tunnel_head[TR_TUNNEL_HASH_SIZE];
+    int16_t tunnel_next[TR_MAX_IFACES];
 };
 
 struct tr_engine {
     pthread_rwlock_t rt_lock;
     struct tr_runtime *rt;
+    _Atomic(struct tr_runtime *) rt_fast;
+    _Atomic bool rt_updating;
+    _Atomic bool rt_reader[TR_MAX_WORKERS];
     uint64_t generation;
     int n_ports;
     int workers;
     struct rte_mempool *mp;
     tr_tx_fn tx;
     void *tx_arg;
+    bool tx_ipv4_cksum;
 
     struct tr_capture *capture;
     struct tr_neigh_table neigh4;
@@ -286,7 +303,29 @@ static int runtime_build(struct tr_engine *e, const struct tr_config *cfg,
     rt->generation = ++e->generation;
     tr_config_copy(&rt->cfg, cfg);
     tr_fib_init(&rt->fib);
+    for (int i = 0; i < TR_MAX_IFACES; i++) {
+        const struct tr_iface *iface = &rt->cfg.ifaces[i];
+        if (!iface->present || iface->kind != TR_IF_VLAN)
+            continue;
+        unsigned h = (unsigned)((iface->parent * 4096 + iface->vlan_id) *
+                                2654435761u) & (TR_VLAN_MAP_SIZE - 1);
+        for (int probe = 0; probe < TR_VLAN_MAP_SIZE; probe++) {
+            struct tr_vlan_map_entry *entry =
+                &rt->vlan_map[(h + (unsigned)probe) & (TR_VLAN_MAP_SIZE - 1)];
+            if (!entry->used) {
+                entry->used = true;
+                entry->parent = iface->parent;
+                entry->vid = (uint16_t)iface->vlan_id;
+                entry->child = (int16_t)i;
+                break;
+            }
+        }
+    }
 
+    for (int i = 0; i < TR_TUNNEL_HASH_SIZE; i++)
+        rt->tunnel_head[i] = -1;
+    for (int i = 0; i < TR_MAX_IFACES; i++)
+        rt->tunnel_next[i] = -1;
     for (int i = 0; i < TR_MAX_IFACES; i++) {
         struct tr_iface *iface = &rt->cfg.ifaces[i];
         if (!iface->present)
@@ -309,6 +348,9 @@ static int runtime_build(struct tr_engine *e, const struct tr_config *cfg,
             }
             t->ready = t->driver && t->remote.family &&
                        (t->local.family || t->local_if_slot >= 0);
+            unsigned h = tr_ip_hash(&t->remote) & (TR_TUNNEL_HASH_SIZE - 1);
+            rt->tunnel_next[i] = rt->tunnel_head[h];
+            rt->tunnel_head[h] = i;
         }
         if (iface->kind == TR_IF_BRIDGE)
             continue;
@@ -369,6 +411,40 @@ static int runtime_build(struct tr_engine *e, const struct tr_config *cfg,
     return 0;
 }
 
+static void runtime_read_enter(struct tr_engine *e, int worker)
+{
+    for (;;) {
+        while (atomic_load_explicit(&e->rt_updating, memory_order_acquire))
+            rte_pause();
+        atomic_store_explicit(&e->rt_reader[worker], true,
+                              memory_order_release);
+        if (!atomic_load_explicit(&e->rt_updating, memory_order_acquire))
+            return;
+        atomic_store_explicit(&e->rt_reader[worker], false,
+                              memory_order_release);
+    }
+}
+
+static void runtime_read_exit(struct tr_engine *e, int worker)
+{
+    atomic_store_explicit(&e->rt_reader[worker], false,
+                          memory_order_release);
+}
+
+static void runtime_pause(struct tr_engine *e)
+{
+    atomic_store_explicit(&e->rt_updating, true, memory_order_release);
+    for (int w = 0; w < e->workers; w++) {
+        while (atomic_load_explicit(&e->rt_reader[w], memory_order_acquire))
+            rte_pause();
+    }
+}
+
+static void runtime_resume(struct tr_engine *e)
+{
+    atomic_store_explicit(&e->rt_updating, false, memory_order_release);
+}
+
 struct tr_engine *tr_engine_create(const struct tr_engine_params *params,
                                    char *err, size_t errlen)
 {
@@ -408,6 +484,7 @@ struct tr_engine *tr_engine_create(const struct tr_engine_params *params,
         return NULL;
     }
     e->rt = rt;
+    atomic_store_explicit(&e->rt_fast, rt, memory_order_release);
     return e;
 }
 
@@ -434,6 +511,12 @@ void tr_engine_set_tx(struct tr_engine *e, tr_tx_fn tx, void *arg)
     e->tx_arg = arg;
 }
 
+void tr_engine_set_tx_ipv4_cksum(struct tr_engine *e, bool enabled)
+{
+    if (e)
+        e->tx_ipv4_cksum = enabled;
+}
+
 void tr_engine_config_env(struct tr_engine *e, struct tr_config_env *env)
 {
     env->n_ports = e->n_ports;
@@ -450,14 +533,17 @@ int tr_engine_apply(struct tr_engine *e, const struct tr_config *cfg,
     if (runtime_build(e, cfg, &nr, err, errlen))
         return -1;
     pthread_rwlock_wrlock(&e->rt_lock);
+    runtime_pause(e);
     old = e->rt;
     e->rt = nr;
-    /* Topology may have changed; stale L2/L3 bindings must not survive.
-     * No worker can be in the data path while the write lock is held. */
+    atomic_store_explicit(&e->rt_fast, nr, memory_order_release);
+    /* No packet reader can observe the old runtime or these tables while
+     * rt_updating is set and rt_active is zero. */
     tr_neigh_clear(&e->neigh4);
     tr_neigh_clear(&e->neigh6);
     for (int i = 0; i < TR_MAX_IFACES; i++)
         tr_bridge_clear(&e->bridges, i);
+    runtime_resume(e);
     pthread_rwlock_unlock(&e->rt_lock);
     runtime_free(old);
     return 0;
@@ -1475,7 +1561,8 @@ static void engine_input_slot(struct tr_engine *e, int worker,
 static int match_tunnel(struct tr_runtime *rt, int ingress, uint8_t family,
                         const struct tr_ip *src, const struct tr_ip *dst)
 {
-    for (int i = 0; i < TR_MAX_IFACES; i++) {
+    unsigned h = tr_ip_hash(src) & (TR_TUNNEL_HASH_SIZE - 1);
+    for (int i = rt->tunnel_head[h]; i >= 0; i = rt->tunnel_next[i]) {
         const struct tr_tunnel_rt *t = &rt->tunnel[i];
         if (!t->ready || t->family != family)
             continue;
@@ -1913,11 +2000,19 @@ static void l3_forward4(struct tr_engine *e, int worker,
         return;
     }
     p[8] = (uint8_t)(ttl - 1);
+    bool hw_cksum = e->tx_ipv4_cksum &&
+                    egress->kind != TR_IF_TUNNEL;
     p[10] = 0;
     p[11] = 0;
-    uint16_t csum = tr_checksum16(p, (uint32_t)(p[0] & 0x0f) * 4, 0);
-    p[10] = (uint8_t)(csum >> 8);
-    p[11] = (uint8_t)csum;
+    if (hw_cksum) {
+        m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
+        m->l2_len = egress->kind == TR_IF_VLAN ? 18 : 14;
+        m->l3_len = (uint16_t)((p[0] & 0x0f) * 4);
+    } else {
+        uint16_t csum = tr_checksum16(p, (uint32_t)(p[0] & 0x0f) * 4, 0);
+        p[10] = (uint8_t)(csum >> 8);
+        p[11] = (uint8_t)csum;
+    }
     next_hop = res.route->has_via ? res.route->via : dst;
     memcpy(mtod(m) + 6, egress->mac, 6);
     memset(mtod(m), 0, 6);
@@ -2175,6 +2270,21 @@ drop:
     rte_pktmbuf_free(m);
 }
 
+static int rt_vlan_lookup(const struct tr_runtime *rt, int parent, uint16_t vid)
+{
+    unsigned h = (unsigned)((parent * 4096 + vid) * 2654435761u) &
+                 (TR_VLAN_MAP_SIZE - 1);
+    for (int probe = 0; probe < TR_VLAN_MAP_SIZE; probe++) {
+        const struct tr_vlan_map_entry *entry =
+            &rt->vlan_map[(h + (unsigned)probe) & (TR_VLAN_MAP_SIZE - 1)];
+        if (!entry->used)
+            return -1;
+        if (entry->parent == parent && entry->vid == vid)
+            return entry->child;
+    }
+    return -1;
+}
+
 static void engine_input_slot(struct tr_engine *e, int worker,
                               struct tr_runtime *rt, int if_slot,
                               struct rte_mbuf *m)
@@ -2193,17 +2303,20 @@ static void engine_input_slot(struct tr_engine *e, int worker,
     if (iface->kind == TR_IF_ETHERNET && pkt_tagged(m)) {
         uint8_t *p = mtod(m);
         uint16_t vid = (uint16_t)((p[14] << 8 | p[15]) & 0x0fff);
-        char name[TR_IFNAME_LEN];
-        snprintf(name, sizeof(name), "%s.%u", iface->name, vid);
-        const struct tr_iface *vlan = tr_config_find_const(&rt->cfg, name);
-        if (vlan && vlan->kind == TR_IF_VLAN && vlan->parent == if_slot) {
+        int child = rt_vlan_lookup(rt, if_slot, vid);
+        if (child >= 0) {
             if (pkt_strip_vlan(m, NULL)) {
                 stats_drop(e, worker, if_slot);
                 rte_pktmbuf_free(m);
                 return;
             }
-            if_slot = vlan->slot;
-            iface = vlan;
+            if_slot = child;
+            iface = rt_iface(rt, child);
+            if (!iface) {
+                stats_drop(e, worker, if_slot);
+                rte_pktmbuf_free(m);
+                return;
+            }
             /* Logical VLAN tap: untagged frame selected by the tag. */
             tr_capture_tap_exact(e->capture, if_slot, TR_CAP_RX, m);
         }
@@ -2233,14 +2346,14 @@ int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
     uint64_t bytes = 0;
     for (uint16_t i = 0; i < n; i++)
         bytes += mlen(mbufs[i]);
-    pthread_rwlock_rdlock(&e->rt_lock);
-    rt = e->rt;
+    runtime_read_enter(e, worker);
+    rt = atomic_load_explicit(&e->rt_fast, memory_order_acquire);
     for (uint16_t i = 0; i < n; i++) {
         if (i + 1 < n)
             rte_prefetch0(rte_pktmbuf_mtod(mbufs[i + 1], void *));
         engine_input_slot(e, worker, rt, if_slot, mbufs[i]);
     }
-    pthread_rwlock_unlock(&e->rt_lock);
+    runtime_read_exit(e, worker);
     stats_rx_bulk(e, worker, if_slot, n, bytes);
     return 0;
 }
@@ -2390,15 +2503,19 @@ static int rebuild_dynamic(struct tr_engine *e)
     int rc;
 
     pthread_rwlock_wrlock(&e->rt_lock);
+    runtime_pause(e);
     rc = runtime_build(e, &e->rt->cfg, &nr, err, sizeof(err));
     if (rc == 0) {
         old = e->rt;
         e->rt = nr;
-        pthread_rwlock_unlock(&e->rt_lock);
+        atomic_store_explicit(&e->rt_fast, nr, memory_order_release);
+    }
+    runtime_resume(e);
+    pthread_rwlock_unlock(&e->rt_lock);
+    if (rc == 0) {
         runtime_free(old);
         return 0;
     }
-    pthread_rwlock_unlock(&e->rt_lock);
     return -1;
 }
 

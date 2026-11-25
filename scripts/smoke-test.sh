@@ -78,6 +78,8 @@ ctl set interfaces ethernet eth0 mtu 9000 >/dev/null
 ctl set interfaces ethernet eth0 address 192.0.2.1/24 >/dev/null
 ctl set interfaces ethernet eth0 address 2001:db8:1::1/64 >/dev/null
 ctl set interfaces ethernet eth0 vlan-id 10 address 192.168.10.1/24 >/dev/null
+ctl set interfaces ethernet eth0.30 address 203.0.113.30/24 >/dev/null
+ctl set interfaces ethernet eth0.30 address ipv6 autoconf >/dev/null
 ctl set interfaces tunnel tun0 encapsulation etherip6 >/dev/null
 ctl set interfaces tunnel tun0 remote 2001:db8:2::2 >/dev/null
 ctl set interfaces tunnel tun0 local-address 2001:db8:2::1 >/dev/null
@@ -94,6 +96,8 @@ show=$(ctl show interfaces)
 expect_contains "$show" "192.0.2.1/24" "host address"
 expect_contains "$show" "192.168.10.1/24" "VLAN address"
 expect_contains "$show" "tcp-mss 0" "tunnel MSS"
+expect_contains "$show" "eth0.30" "VLAN alias"
+expect_contains "$show" "address ipv6 autoconf" "VLAN autoconf"
 
 routes=$(ctl show routes)
 expect_contains "$routes" "192.0.2.0/24" "connected IPv4 route"

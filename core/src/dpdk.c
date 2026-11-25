@@ -37,6 +37,9 @@ struct tr_dpdk {
     _Atomic int port_slot[TR_PORT_MAX];
     _Atomic int slot_port[TR_IFACE_MAX];
     int port_nq[TR_PORT_MAX];
+    _Atomic int active_ports[TR_PORT_MAX];
+    _Atomic int nactive;
+    bool port_tx_ipv4_cksum[TR_PORT_MAX];
     _Atomic bool stop;
     _Atomic bool workers_running;
     struct tr_tx_batch tx[TR_MAX_WORKERS][TR_PORT_MAX];
@@ -131,6 +134,14 @@ int tr_dpdk_refresh(struct tr_dpdk *d)
             }
         }
     }
+    int na = 0;
+    for (int port = 0; port < d->nports; port++) {
+        if (atomic_load_explicit(&d->port_slot[port], memory_order_acquire) >= 0 &&
+            d->port_nq[port] > 0)
+            atomic_store_explicit(&d->active_ports[na++], port,
+                                  memory_order_relaxed);
+    }
+    atomic_store_explicit(&d->nactive, na, memory_order_release);
     return 0;
 }
 
@@ -193,7 +204,13 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
                 "port %u: RSS unsupported by PMD; using 1 RX queue\n", port);
     }
     conf.rxmode.offloads = 0;
-    conf.txmode.offloads = 0;
+    if (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) {
+        conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+        d->port_tx_ipv4_cksum[port] = true;
+    } else {
+        conf.txmode.offloads = 0;
+        d->port_tx_ipv4_cksum[port] = false;
+    }
 
     ret = rte_eth_dev_configure(port, nq, nq, &conf);
     if (ret != 0) {
@@ -203,6 +220,8 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
         conf.rxmode.mtu = 1500;
         conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
         conf.rx_adv_conf.rss_conf.rss_hf = 0;
+        conf.txmode.offloads = 0;
+        d->port_tx_ipv4_cksum[port] = false;
         ret = rte_eth_dev_configure(port, nq, nq, &conf);
         if (ret != 0 && nq > 1) {
             nq = 1;
@@ -294,11 +313,15 @@ int tr_dpdk_start(struct tr_dpdk *d, char *err, size_t errlen)
     /* Bring up every DPDK port, including ports that are currently not
      * bound to a logical interface.  This permits `set interfaces ethernet
      * <name> port <id>` on a running router without restarting the PMD. */
+    bool all_tx_ipv4_cksum = d->nports > 0;
     for (int port = 0; port < d->nports; port++) {
         mtu = TR_PORT_MTU_MAX;
         if (configure_port(d, (uint16_t)port, mtu, err, errlen))
             return -1;
+        if (!d->port_tx_ipv4_cksum[port])
+            all_tx_ipv4_cksum = false;
     }
+    tr_engine_set_tx_ipv4_cksum(d->engine, all_tx_ipv4_cksum);
     tr_dpdk_refresh(d);
     if (d->workers > 0) {
         int n = 0;
@@ -331,10 +354,14 @@ static int worker_main(void *arg)
     struct tr_dpdk *d = wa->d;
     int worker = wa->worker;
     struct rte_mbuf *bufs[TR_RX_BURST];
+    unsigned idle_loops = 0;
 
     while (!atomic_load_explicit(&d->stop, memory_order_relaxed)) {
         bool did_work = false;
-        for (int port = 0; port < d->nports; port++) {
+        int nactive = atomic_load_explicit(&d->nactive, memory_order_acquire);
+        for (int ai = 0; ai < nactive; ai++) {
+            int port = atomic_load_explicit(&d->active_ports[ai],
+                                            memory_order_relaxed);
             int if_slot = atomic_load_explicit(&d->port_slot[port],
                                                memory_order_acquire);
             int nq = d->port_nq[port];
@@ -345,12 +372,16 @@ static int worker_main(void *arg)
             if (!n)
                 continue;
             did_work = true;
+            idle_loops = 0;
             tr_engine_input_burst(d->engine, worker, if_slot, bufs, n);
             tx_flush_all(d, worker);
         }
         if (!did_work) {
             tx_flush_all(d, worker);
-            rte_delay_us_block(20);
+            if (idle_loops++ < 64)
+                rte_pause();
+            else
+                rte_delay_us_block(20);
         }
     }
     tx_flush_all(d, worker);

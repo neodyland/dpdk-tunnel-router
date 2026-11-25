@@ -39,6 +39,7 @@ struct tr_engine *tr_engine_create(const struct tr_engine_params *params,
                                    char *err, size_t errlen);
 void tr_engine_destroy(struct tr_engine *e);
 void tr_engine_set_tx(struct tr_engine *e, tr_tx_fn tx, void *arg);
+void tr_engine_set_tx_ipv4_cksum(struct tr_engine *e, bool enabled);
 
 int tr_engine_apply(struct tr_engine *e, const struct tr_config *cfg,
                     char *err, size_t errlen);

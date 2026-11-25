@@ -157,6 +157,35 @@ static struct rte_mbuf *build_ipv6(struct rte_mempool *mp,
     return m;
 }
 
+static struct rte_mbuf *build_tagged_ipv6(struct rte_mempool *mp,
+                                         const uint8_t eth_dst[6],
+                                         const uint8_t eth_src[6],
+                                         uint16_t vid, const struct in6_addr *src,
+                                         const struct in6_addr *dst, uint8_t hop,
+                                         uint8_t next, const uint8_t *payload,
+                                         uint32_t payload_len)
+{
+    struct rte_mbuf *m = alloc_frame(mp, 14 + 4 + 40 + payload_len);
+    if (!m)
+        return NULL;
+    uint8_t *p = mtod(m);
+    eth_fill(p, eth_dst, eth_src, 0x8100);
+    p[14] = (uint8_t)(vid >> 8);
+    p[15] = (uint8_t)vid;
+    p[16] = 0x86;
+    p[17] = 0xdd;
+    uint8_t *ip = p + 18;
+    ip[0] = 0x60;
+    ip[4] = (uint8_t)(payload_len >> 8);
+    ip[5] = (uint8_t)payload_len;
+    ip[6] = next;
+    ip[7] = hop;
+    memcpy(ip + 8, src, 16);
+    memcpy(ip + 24, dst, 16);
+    memcpy(ip + 40, payload, payload_len);
+    return m;
+}
+
 static struct rte_mbuf *build_arp(struct rte_mempool *mp,
                                   const uint8_t eth_dst[6],
                                   const uint8_t eth_src[6], uint16_t op,
@@ -373,6 +402,22 @@ static int test_ipv4_route(struct rte_mempool *mp, struct capture *cap)
     CHECK(p[22] == 63); /* TTL decremented */
     CHECK(memcmp(p + 30, &dst.u.v4, 4) == 0);
     CHECK(ip_checksum(p + 14, 20) == 0);
+
+    /* With hardware IPv4 checksum offload the header checksum is left zero
+     * and the PMD is asked to fill it in. */
+    tr_engine_set_tx_ipv4_cksum(e, true);
+    m = build_ipv4(mp, eth0_mac, peer_mac, &src, &dst, 64, 17, payload, 8, 8);
+    CHECK(m != NULL);
+    capture_reset(cap);
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+    CHECK(cap->n == 1);
+    p = mtod(cap->m[0]);
+    CHECK((cap->m[0]->ol_flags & RTE_MBUF_F_TX_IP_CKSUM) != 0);
+    CHECK((cap->m[0]->ol_flags & RTE_MBUF_F_TX_IPV4) != 0);
+    CHECK(cap->m[0]->l2_len == 14);
+    CHECK(cap->m[0]->l3_len == 20);
+    CHECK(p[24] == 0 && p[25] == 0);
+    tr_engine_set_tx_ipv4_cksum(e, false);
     capture_reset(cap);
     tr_engine_destroy(e);
     (void)bcast;
@@ -899,6 +944,103 @@ static int test_autoconf(struct rte_mempool *mp, struct capture *cap)
 }
 
 
+static int test_vlan_autoconf(struct rte_mempool *mp, struct capture *cap)
+{
+    struct tr_config cfg, env_cfg;
+    struct tr_config_env env;
+    struct tr_engine *e;
+    char err[256];
+    const uint8_t eth0_mac[6] = {0x02, 0, 0, 0, 0, 1};
+    const uint8_t peer_mac[6] = {0x02, 0, 0, 0, 0, 0x22};
+    struct in6_addr me_ll, peer_ll, all_nodes, prefix;
+    uint8_t ra[16 + 32 + 8];
+
+    setup_config(&cfg, &env);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth0 port 0") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0.20 address "
+                        "ipv6 autoconf") == 0);
+    CHECK(set_mac(&cfg, "eth0", eth0_mac) == 0);
+    struct tr_iface *vlan = tr_config_find(&cfg, "eth0.20");
+    CHECK(vlan != NULL && vlan->ipv6_autoconf);
+    memcpy(vlan->mac, eth0_mac, 6);
+    e = tr_engine_create(&(struct tr_engine_params){.n_ports = 2,
+                                                    .workers = 1,
+                                                    .mp = mp},
+                         err, sizeof(err));
+    CHECK(e != NULL);
+    tr_engine_set_tx(e, capture_tx, cap);
+    CHECK(tr_engine_apply(e, &cfg, err, sizeof(err)) == 0);
+    tr_engine_config_copy(e, &env_cfg);
+    int eth0 = tr_config_find_const(&env_cfg, "eth0")->slot;
+
+    /* Router Solicitation for the autoconf VLAN must be tagged with VLAN 20. */
+    capture_reset(cap);
+    tr_engine_send_router_solicitations(e);
+    CHECK(cap->n == 1);
+    uint8_t *rs = mtod(cap->m[0]);
+    CHECK((rs[12] << 8 | rs[13]) == 0x8100);
+    CHECK((rs[14] & 0x0f) == 0 && rs[15] == 20);
+    CHECK((rs[16] << 8 | rs[17]) == 0x86dd);
+    CHECK(rs[18 + 6] == 58);
+    CHECK(rs[18 + 40] == 133);
+    capture_reset(cap);
+
+    tr_ip6_linklocal(eth0_mac, &me_ll);
+    inet_pton(AF_INET6, "fe80::2", &peer_ll);
+    inet_pton(AF_INET6, "ff02::1", &all_nodes);
+    inet_pton(AF_INET6, "2001:db8:20::", &prefix);
+    memset(ra, 0, sizeof(ra));
+    ra[0] = 134;
+    ra[4] = 64;
+    ra[6] = 0x07;
+    ra[7] = 0x08;
+    ra[16] = 3;
+    ra[17] = 4;
+    ra[18] = 64;
+    ra[19] = 0x40;
+    ra[23] = 0x0e;
+    ra[27] = 0x08;
+    memcpy(ra + 32, &prefix, 16);
+    ra[48] = 1;
+    ra[49] = 1;
+    memcpy(ra + 50, peer_mac, 6);
+    uint32_t sum = 0;
+    sum = csum_add(sum, (const uint8_t *)&peer_ll, 16);
+    sum = csum_add(sum, (const uint8_t *)&all_nodes, 16);
+    sum += sizeof(ra);
+    sum += 58;
+    sum = csum_add(sum, ra, sizeof(ra));
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    uint16_t c = (uint16_t)~sum;
+    ra[2] = (uint8_t)(c >> 8);
+    ra[3] = (uint8_t)c;
+    struct rte_mbuf *m =
+        build_tagged_ipv6(mp, (uint8_t[6]){0x33, 0x33, 0, 0, 0, 1},
+                          peer_mac, 20, &peer_ll, &all_nodes, 255, 58, ra,
+                          sizeof(ra));
+    CHECK(m != NULL);
+    capture_reset(cap);
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+    tr_engine_housekeeping(e, 0);
+    char *routes = NULL;
+    CHECK(tr_engine_show(e, 1, (char *[]){"routes"}, &routes) == 0);
+    CHECK(strstr(routes, "2001:db8:20::/64") != NULL);
+    CHECK(strstr(routes, "fe80::2") != NULL);
+    free(routes);
+    char *ifaces = NULL;
+    char *argv[] = {"interfaces"};
+    CHECK(tr_engine_show(e, 1, argv, &ifaces) == 0);
+    CHECK(strstr(ifaces, "eth0.20") != NULL);
+    CHECK(strstr(ifaces, "autoconf") != NULL);
+    CHECK(strstr(ifaces, "2001:db8:20") != NULL);
+    free(ifaces);
+    capture_reset(cap);
+    tr_engine_destroy(e);
+    return 0;
+}
+
 static int test_etherip4(struct rte_mempool *mp, struct capture *cap)
 {
     struct tr_config cfg, env_cfg;
@@ -1092,6 +1234,7 @@ int main(void)
     rc |= test_ndp(mp, &cap);
     rc |= test_tunnel_overlay(mp, &cap);
     rc |= test_vlan(mp, &cap);
+    rc |= test_vlan_autoconf(mp, &cap);
     rc |= test_bridge(mp, &cap);
     rc |= test_autoconf(mp, &cap);
     rc |= test_etherip4(mp, &cap);

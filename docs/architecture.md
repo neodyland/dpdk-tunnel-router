@@ -14,11 +14,11 @@ routerctl ── "set interfaces tunnel ..." ──▶ core (main lcore)
                        ┌─────────────────────┴─────────────────────┐
                        │ 1. 現行設定をコピー                       │
                        │ 2. パース / 検証 / FIB 構築               │
-                       │ 3. 不変 runtime を rwlock で差し替え      │
+                       │ 3. 不変 runtime を reader gate で差し替え │
                        │ 4. 成功時だけ設定ファイルを原子的に保存   │
                        └─────────────────────┬─────────────────────┘
                                              │
-              worker lcores (read lock per burst)
+              worker lcores (lock-free reader gate)
               RX burst → L2/L3 engine → TX burst
 ```
 
@@ -69,7 +69,8 @@ struct cli_session {
 1. `base_revision` と現在の revision を比較し、別セッションの変更を検出。
 2. candidate のコピーに NIC MAC を適用し、`tr_config_validate()`。
 3. `tr_engine_apply()` が新しい FIB と runtime を構築。
-4. `rwlock` の write lock 下で runtime ポインタを差し替え。
+4. `rt_lock` の write lock 下で writer gate を閉じ、全ワーカーの reader flag
+   が下りるのを待って runtime ポインタを差し替え。
 5. `tr_config_save()` が設定ファイルを原子的に更新。
 6. 保存に失敗した場合は旧 runtime を再適用してロールバック。
 7. 成功時に revision を進め、`dirty` を落とす。
@@ -108,7 +109,7 @@ struct tr_runtime {
 };
 ```
 
-- `cfg` は設定のコピー。ワーカーは read lock 下でのみ参照。
+- `cfg` は設定のコピー。ワーカーは reader gate 中の不変スナップショットとして参照。
 - `fib` は connected / static / SLAAC ルートを入れた LPM トライ。
 - `tunnel` はドライバーポインタ、外側アドレス、local-interface、MTU、
   MSS ポリシーを事前解決したもの。
@@ -126,7 +127,7 @@ IPv4/IPv6 それぞれ 2 分トライで最長一致を行います。connected 
 
 - `--workers N` で N 個のワーカー lcore。
 - ポートごとに最大 16 の RX/TX キューを作成し、RSS でフロー分散。
-- ワーカーは RX バーストごとに `rt_lock` の read lock を取得。設定差し替え
+- ワーカーは RX バーストごとに per-worker reader flag を立てる。設定差し替え
   以外ではブロックしない。
 - 近隣キャッシュとブリッジ MAC テーブルは 64 バケットの spinlock。
 - フラグメント再組み立てはワーカーごとの独立テーブル（ロックなし）。

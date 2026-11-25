@@ -193,6 +193,29 @@ static int set_tunnel(struct tr_config *cfg, const struct tr_config_env *env,
     return 0;
 }
 
+static struct tr_iface *ensure_dotted_vlan(struct tr_config *cfg,
+                                           const char *name, char *err,
+                                           size_t errlen)
+{
+    char parent_name[TR_IFNAME_LEN];
+    const char *dot = strrchr(name, '.');
+    uint32_t vid;
+
+    if (!dot || dot == name || !dot[1])
+        return NULL;
+    size_t n = (size_t)(dot - name);
+    if (n >= sizeof(parent_name))
+        return NULL;
+    memcpy(parent_name, name, n);
+    parent_name[n] = '\0';
+    if (tr_parse_u32(dot + 1, 1, 4094, &vid))
+        return NULL;
+    struct tr_iface *parent = tr_config_find(cfg, parent_name);
+    if (!parent || parent->kind != TR_IF_ETHERNET)
+        return NULL;
+    return tr_config_ensure_vlan(cfg, parent, (int)vid, err, errlen);
+}
+
 static int port_from_eth_name(const char *name, int nports, int *port)
 {
     const char *p;
@@ -227,14 +250,26 @@ static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
         return errf(err, errlen, "set interfaces ethernet <name> ...");
     name = argv[3];
     iface = tr_config_find(cfg, name);
-    if (iface && iface->kind != TR_IF_ETHERNET)
-        return errf(err, errlen, "interface '%s' is not ethernet", name);
+    if (iface && iface->kind != TR_IF_ETHERNET &&
+        iface->kind != TR_IF_VLAN)
+        return errf(err, errlen, "interface '%s' is not ethernet/VLAN", name);
     if (!iface) {
         int inferred = -1;
         if (i < argc && strcmp(argv[i], "port") == 0) {
             iface = tr_config_create(cfg, name, TR_IF_ETHERNET, err, errlen);
             if (!iface)
                 return -1;
+        } else if (strchr(name, '.') != NULL) {
+            /* `eth0.10` is an alias for vlan-id 10 on eth0. */
+            iface = ensure_dotted_vlan(cfg, name, err, errlen);
+            if (!iface) {
+                if (!err || !err[0])
+                    return errf(err, errlen,
+                                "invalid VLAN interface '%s' (parent must be "
+                                "ethernet and VLAN ID 1..4094)",
+                                name);
+                return -1;
+            }
         } else if (port_from_eth_name(name,
                                       env ? env->n_ports : -1,
                                       &inferred) == 0 &&
@@ -246,8 +281,9 @@ static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
             iface->port_id = inferred;
         } else {
             return errf(err, errlen,
-                        "unknown ethernet interface '%s' (use eth<DPDK port> "
-                        "or 'set interfaces ethernet %s port <id>')",
+                        "unknown ethernet interface '%s' (use eth<DPDK port>, "
+                        "eth<port>.<vid>, or 'set interfaces ethernet %s "
+                        "port <id>')",
                         name, name);
         }
     }
@@ -256,6 +292,10 @@ static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
     while (i < argc) {
         const char *op = argv[i++];
         if (strcmp(op, "port") == 0) {
+            if (iface->kind != TR_IF_ETHERNET)
+                return errf(err, errlen,
+                            "port is only valid on a parent ethernet "
+                            "interface");
             uint32_t port;
             if (i >= argc)
                 return errf(err, errlen, "port requires a value");
@@ -277,6 +317,10 @@ static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
                 return -1;
         } else if (strcmp(op, "vlan-id") == 0) {
             uint32_t vid;
+            if (iface->kind != TR_IF_ETHERNET)
+                return errf(err, errlen,
+                            "vlan-id is only valid on a parent ethernet "
+                            "interface");
             if (i >= argc)
                 return errf(err, errlen, "vlan-id requires a value");
             if (tr_parse_u32(argv[i], 1, 4094, &vid))

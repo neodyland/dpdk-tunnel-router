@@ -20,7 +20,7 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
                  │  command parser / config DB  │
                  │  atomic config + persistence │
                  └──────────────┬───────────────┘
-                                │ rwlock: immutable runtime snapshot
+                                │ reader gate: immutable runtime snapshot
              ┌──────────────────┼──────────────────┐
              ▼                  ▼                  ▼
         worker 0           worker 1           worker N     (RSS queues)
@@ -44,7 +44,7 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
 | VLAN | `set interfaces ethernet eth0 vlan-id 10 ...` で `eth0.10` を作成。タグ終端、L3、ブリッジメンバーに対応 |
 | ブリッジ | MAC 学習、フラッディング、エージング。VLAN 子インタフェースやトンネルをメンバーにできる |
 | 静的ルート | IPv4/IPv6 の最長一致FIB。再帰的な next-hop 解決に対応 |
-| 並列処理 | DPDK RSS + マルチキュー + ワーカー lcore。設定は RCU 風の不変スナップショットを rwlock で切替 |
+| 並列処理 | DPDK RSS + マルチキュー + ワーカー lcore。パケット処理はロックなし、設定は reader gate 付きの不変スナップショット差し替え |
 | デバッグキャプチャ | `tcpdump start/stop/status` で pcap を取得。物理 RX/TX、トンネル内側 RX/TX、簡易フィルタ、count/snaplen 対応 |
 | 永続化 | 正常に適用された設定だけをコアが原子的に保存。クライアントは設定ファイルを書かない |
 
@@ -313,8 +313,9 @@ set interfaces tunnel <Tunnel name> address <prefix / ipv6 autoconf>
 set interfaces ethernet <ethernet name> port <DPDK port ID>   # 拡張
 set interfaces ethernet <ethernet name> address <prefix / ipv6 autoconf>
 set interfaces ethernet <ethernet name> mtu <mtu>
-set interfaces ethernet <ethernet name> vlan-id <VLAN ID> address <prefix>
+set interfaces ethernet <ethernet name> vlan-id <VLAN ID> address <prefix|ipv6 autoconf>
 set interfaces ethernet <ethernet name> vlan-id <VLAN ID> mtu <mtu>
+set interfaces ethernet <ethernet name>.<VLAN ID> address <prefix|ipv6 autoconf>  # alias
 
 set interfaces bridge <Bridge name> children <Interface name>
 set interfaces bridge <Bridge name> mtu <mtu>
@@ -332,7 +333,13 @@ set protocols static route <IPv4/IPv6 prefix> via <same-family next-hop>
   `192.0.2.0/24`）。
 - `ipv6 autoconf` は RA の Prefix Information Option（A フラグ）から
   SLAAC アドレスを作り、RA 送信元へのデフォルトルートを入れます。
+  VLAN 子でも同じで、タグ付き RA を受信すると VLAN に SLAAC アドレスと
+  デフォルトルートをインストールします。
 - `vlan-id` は `<ethernet>.<vid>` という VLAN 子インタフェースを作ります。
+  子は `set interfaces ethernet eth0.10 ...` のように直接指定することもできます。
+- VLAN 子でも IPv4/IPv6 の静的アドレスと `address ipv6 autoconf` が使えます。
+  VLAN タグ付きの RA を受信すると、その VLAN に SLAAC アドレスと
+  デフォルトルートをインストールします。
 - ブリッジの children は L2 インタフェース（Ethernet / VLAN / Tunnel）です。
   L3 アドレスを持つインタフェースはブリッジメンバーにできません。
 - `tcp-mss auto` はアンダーレイ MTU から外側ヘッダーと内側 IP/TCP ヘッダーを
@@ -479,8 +486,11 @@ C の組み込みドライバーは `struct tr_tnl_driver` の vtable、Rust は
 - `--workers N` で N 個のワーカー lcore を起動します。
 - 各 DPDK ポートに N 個（PMD の上限まで）の RX/TX キューを作り、RSS で
   フローを分散します。
-- 設定は不変の `struct tr_runtime` として構築し、rwlock で一括差し替え。
-  ワーカーはバースト単位で read lock を保持するため、途中状態を見ません。
+- 設定は不変の `struct tr_runtime` として構築し、一括差し替え。
+  パケット処理は per-worker の reader flag と writer gate だけを使い、
+  通常の RX/TX パスでは `rwlock` を取得しません。設定変更時は writer が
+  reader の drain を待ってから旧 runtime を解放します。
+  `show` や設定コピーなどの制御処理は引き続き `rt_lock` で保護します。
 - 近隣キャッシュ・MAC 学習テーブルはバケット単位の spinlock、フラグメント
   再組み立てはワーカーごとの独立コンテキストです。
 - 設定変更時は近隣 / MAC テーブルをクリアし、古いバインディングを残しません。
@@ -490,16 +500,28 @@ C の組み込みドライバーは `struct tr_tnl_driver` の vtable、Rust は
 
 ### 8.1 性能最適化
 
-- RX バースト 64 パケット単位で処理し、runtime の read lock はバーストごとに
-  1 回だけ取得
+- RX バースト 64 パケット単位で処理。パケットパスから `rwlock` を排除し、
+  per-worker reader flag と writer gate で runtime を差し替え
+- VLAN は親スロット + VLAN ID のハッシュで子スロットを直接取得（名前検索なし）
+- トンネルは outer remote アドレスのハッシュで候補を絞り込み
 - CPU ごとの経路キャッシュ（1024 entries）と近隣キャッシュ（512 entries、
   2 秒 TTL）で FIB トライ / ARP・NDP テーブルのロックを省略
 - TX はワーカーごと・ポートごとに最大 32 パケットをバッチし、
   `rte_eth_tx_burst()` を 1 回で発行
 - RX バースト内で次の mbuf をプリフェッチ
 - コアの C コンパイルを `-O3`（DPDK の `-march=native` と併用）
+- 全ポートが対応している場合のみ IPv4 TX checksum offload を有効化
+- バインド済みポートだけをポーリングする active port リストと、
+  アイドル時の adaptive polling（busy poll → sleep）
 - 経路・近隣キャッシュは runtime generation で自動無効化。設定変更後は
   古いエントリを使いません。
+- FIB は per-worker 経路キャッシュでヒット時 O(1)。コールドパスはビットトライの
+  ままです。`rte_lpm` / `rte_lpm6` への置換は、ルートメタデータ（connected /
+  recursive next-hop / route_id）の保持と、EAL なしで動く FIB テストの
+  都合から今回は見送りました。
+- TX checksum offload は全ポートが `RTE_ETH_TX_OFFLOAD_IPV4_CKSUM` を
+  広告する場合のみ有効化します。RX checksum offload は VLAN タグを保持し、
+  転送パスで L4 checksum を検証しないため有効化していません。
 
 簡易ベンチマークを実行できます。
 
@@ -508,7 +530,7 @@ make bench
 ```
 
 1 ワーカー、ARP 解決済みの IPv4 フォワーディングを 200 万パケット処理する
-合成ベンチです。NIC 性能ではなく、エンジンとロック/キャッシュ/TX バッチの
+合成ベンチです。NIC 性能ではなく、エンジンと reader gate/キャッシュ/TX バッチの
 効果を確認するためのものです。手元の環境では、最適化前の約 3.0 Mpps から
 burst API で約 4.9 Mpps 程度まで改善しました（`taskset` で 1 コア固定、
 環境により変動）。single API は実行ごとの変動が大きく、約 3〜4 Mpps でした。
