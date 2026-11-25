@@ -50,6 +50,9 @@ int tr_engine_show(struct tr_engine *e, int argc, char **argv, char **out);
 
 int tr_engine_input(struct tr_engine *e, int worker, int if_slot,
                     struct rte_mbuf *m);
+/* Process a whole RX burst under one runtime read lock. */
+int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
+                          struct rte_mbuf **mbufs, uint16_t n);
 void tr_engine_housekeeping(struct tr_engine *e, uint64_t now_ms);
 void tr_engine_send_router_solicitations(struct tr_engine *e);
 

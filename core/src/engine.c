@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
+#include <rte_prefetch.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,26 @@
 #define TR_DYN_ADDR_MAX 64
 #define TR_DYN_ROUTE_MAX 64
 #define TR_RA_QUEUE 64
+#define TR_RT_CACHE_SIZE 1024
+#define TR_NEIGH_CACHE_SIZE 512
+#define TR_NEIGH_CACHE_TTL_MS 2000
+
+struct tr_rt_cache_entry {
+    uint64_t generation;
+    uint8_t family;
+    struct tr_ip dst;
+    const struct tr_fib_route *route;
+    uint16_t plen;
+};
+
+struct tr_neigh_cache_entry {
+    uint64_t generation;
+    uint64_t seen_ms;
+    int if_slot;
+    struct tr_ip ip;
+    uint8_t mac[6];
+    bool valid;
+};
 
 struct tr_tunnel_rt {
     bool ready;
@@ -116,6 +137,9 @@ struct tr_engine {
     struct tr_reasm reasm[TR_MAX_WORKERS];
 
     struct tr_if_stats stats[TR_MAX_IFACES][TR_MAX_WORKERS];
+    struct tr_rt_cache_entry rt_cache[TR_MAX_WORKERS][TR_RT_CACHE_SIZE];
+    struct tr_neigh_cache_entry
+        neigh_cache[TR_MAX_WORKERS][TR_NEIGH_CACHE_SIZE];
 
     struct tr_dyn_addr dyn_addr[TR_DYN_ADDR_MAX];
     struct tr_dyn_route dyn_route[TR_DYN_ROUTE_MAX];
@@ -171,14 +195,14 @@ static void stats_drop(struct tr_engine *e, int worker, int if_slot)
                                   memory_order_relaxed);
 }
 
-static void stats_rx(struct tr_engine *e, int worker, int if_slot,
-                     uint32_t len)
+static void stats_rx_bulk(struct tr_engine *e, int worker, int if_slot,
+                          uint32_t pkts, uint64_t bytes)
 {
     if (if_slot >= 0 && if_slot < TR_MAX_IFACES && worker >= 0 &&
-        worker < TR_MAX_WORKERS) {
-        atomic_fetch_add_explicit(&e->stats[if_slot][worker].rx_pkts, 1,
+        worker < TR_MAX_WORKERS && pkts) {
+        atomic_fetch_add_explicit(&e->stats[if_slot][worker].rx_pkts, pkts,
                                   memory_order_relaxed);
-        atomic_fetch_add_explicit(&e->stats[if_slot][worker].rx_bytes, len,
+        atomic_fetch_add_explicit(&e->stats[if_slot][worker].rx_bytes, bytes,
                                   memory_order_relaxed);
     }
 }
@@ -591,6 +615,81 @@ static uint32_t checksum_add_pseudo6(uint32_t sum, const uint8_t *src,
 static void tunnel_send(struct tr_engine *e, int worker,
                         struct tr_runtime *rt, int if_slot,
                         struct rte_mbuf *m);
+static unsigned rt_cache_hash(const struct tr_ip *ip)
+{
+    if (ip->family == TR_AF_INET) {
+        uint32_t x = ntohl(ip->u.v4.s_addr);
+        x *= 2654435761u;
+        return (unsigned)(x ^ (x >> 16));
+    }
+    uint32_t w[4];
+    memcpy(w, ip->u.v6.s6_addr, sizeof(w));
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 4; i++) {
+        h ^= w[i];
+        h *= 16777619u;
+    }
+    return (unsigned)(h ^ (h >> 16));
+}
+
+static int fib_lookup_cached(struct tr_engine *e, int worker,
+                             struct tr_runtime *rt, const struct tr_ip *dst,
+                             struct tr_fib_result *out)
+{
+    struct tr_rt_cache_entry *c;
+    unsigned idx;
+
+    if (!e || worker < 0 || worker >= e->workers)
+        return tr_fib_lookup(&rt->fib, dst, out);
+    idx = rt_cache_hash(dst) & (TR_RT_CACHE_SIZE - 1);
+    c = &e->rt_cache[worker][idx];
+    if (c->generation == rt->generation && c->family == dst->family &&
+        c->route && tr_ip_equal(&c->dst, dst)) {
+        out->route = c->route;
+        out->prefix_len = c->plen;
+        return 0;
+    }
+    if (tr_fib_lookup(&rt->fib, dst, out))
+        return -1;
+    c->generation = rt->generation;
+    c->family = dst->family;
+    c->dst = *dst;
+    c->route = out->route;
+    c->plen = (uint16_t)out->prefix_len;
+    return 0;
+}
+
+static int neigh_lookup_cached(struct tr_engine *e, int worker,
+                               struct tr_runtime *rt, int if_slot,
+                               const struct tr_ip *ip, uint64_t now,
+                               uint8_t mac[6], uint8_t *state)
+{
+    struct tr_neigh_table *t =
+        ip->family == TR_AF_INET ? &e->neigh4 : &e->neigh6;
+    unsigned h = tr_ip_hash(ip) ^ ((unsigned)if_slot * 2654435761u);
+    struct tr_neigh_cache_entry *c =
+        &e->neigh_cache[worker][h & (TR_NEIGH_CACHE_SIZE - 1)];
+
+    if (c->valid && c->generation == rt->generation &&
+        c->if_slot == if_slot && tr_ip_equal(&c->ip, ip) &&
+        now >= c->seen_ms && now - c->seen_ms < TR_NEIGH_CACHE_TTL_MS) {
+        memcpy(mac, c->mac, 6);
+        if (state)
+            *state = TR_NEIGH_REACHABLE;
+        return 1;
+    }
+    if (tr_neigh_get(t, if_slot, ip, mac, now, state)) {
+        c->valid = true;
+        c->generation = rt->generation;
+        c->seen_ms = now;
+        c->if_slot = if_slot;
+        c->ip = *ip;
+        memcpy(c->mac, mac, 6);
+        return 1;
+    }
+    return 0;
+}
+
 static void resolve_and_send(struct tr_engine *e, int worker,
                              struct tr_runtime *rt, int if_slot,
                              const struct tr_ip *next_hop,
@@ -1048,7 +1147,8 @@ static void resolve_and_send(struct tr_engine *e, int worker,
         return;
     }
     t = next_hop->family == TR_AF_INET ? &e->neigh4 : &e->neigh6;
-    if (tr_neigh_get(t, if_slot, next_hop, mac, now, &state)) {
+    if (neigh_lookup_cached(e, worker, rt, if_slot, next_hop, now, mac,
+                            &state)) {
         if (mlen(m) >= 6)
             memcpy(mtod(m), mac, 6);
         egress_frame(e, worker, rt, if_slot, m);
@@ -1066,13 +1166,14 @@ static void resolve_and_send(struct tr_engine *e, int worker,
 
 static int if_slot_stats_valid(struct tr_engine *e, int worker, int if_slot);
 
-static int underlay_next_hop(struct tr_runtime *rt, int if_slot,
+static int underlay_next_hop(struct tr_engine *e, int worker,
+                             struct tr_runtime *rt, int if_slot,
                              const struct tr_ip *remote,
                              struct tr_ip *next_hop)
 {
     struct tr_fib_result res;
 
-    if (tr_fib_lookup(&rt->fib, remote, &res) == 0 &&
+    if (fib_lookup_cached(e, worker, rt, remote, &res) == 0 &&
         res.route->if_slot >= 0) {
         if (res.route->connected)
             *next_hop = *remote;
@@ -1270,7 +1371,7 @@ static void tunnel_send(struct tr_engine *e, int worker,
         under_slot = t->local_if_slot;
     } else {
         struct tr_fib_result res;
-        if (tr_fib_lookup(&rt->fib, &t->remote, &res) ||
+        if (fib_lookup_cached(e, worker, rt, &t->remote, &res) ||
             res.route->if_slot < 0) {
             stats_drop(e, worker, if_slot);
             rte_pktmbuf_free(m);
@@ -1330,7 +1431,7 @@ static void tunnel_send(struct tr_engine *e, int worker,
     m->data_len = frame.len;
     under_mtu = under->mtu;
     len = mlen(m);
-    if (underlay_next_hop(rt, under_slot, &t->remote, &next_hop)) {
+    if (underlay_next_hop(e, worker, rt, under_slot, &t->remote, &next_hop)) {
         stats_drop(e, worker, if_slot);
         rte_pktmbuf_free(m);
         return;
@@ -1756,7 +1857,8 @@ static void l3_forward4(struct tr_engine *e, int worker,
         }
         return;
     }
-    if (tr_fib_lookup(&rt->fib, &dst, &res) || res.route->if_slot < 0) {
+    if (fib_lookup_cached(e, worker, rt, &dst, &res) ||
+        res.route->if_slot < 0) {
         send_icmp4_error(e, worker, rt, if_slot, m, l3off,
                          ICMP_DEST_UNREACH, 0, 0);
         stats_drop(e, worker, if_slot);
@@ -1843,7 +1945,8 @@ static void l3_forward6(struct tr_engine *e, int worker,
         }
         return;
     }
-    if (tr_fib_lookup(&rt->fib, &dst, &res) || res.route->if_slot < 0) {
+    if (fib_lookup_cached(e, worker, rt, &dst, &res) ||
+        res.route->if_slot < 0) {
         send_icmp6_error(e, worker, rt, if_slot, m, l3off,
                          ICMPV6_DEST_UNREACH, 0, 0);
         stats_drop(e, worker, if_slot);
@@ -2111,24 +2214,41 @@ static void engine_input_slot(struct tr_engine *e, int worker,
         l3_ingress(e, worker, rt, if_slot, m);
 }
 
-int tr_engine_input(struct tr_engine *e, int worker, int if_slot,
-                    struct rte_mbuf *m)
+int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
+                          struct rte_mbuf **mbufs, uint16_t n)
 {
     struct tr_runtime *rt;
 
-    if (!e || !m)
+    if (!e || !mbufs)
         return -1;
     if (worker < 0 || worker >= e->workers) {
-        rte_pktmbuf_free(m);
+        for (uint16_t i = 0; i < n; i++)
+            rte_pktmbuf_free(mbufs[i]);
         return -1;
     }
-    tr_capture_tap(e->capture, if_slot, TR_CAP_RX, m);
+    if (n == 0)
+        return 0;
+    for (uint16_t i = 0; i < n; i++)
+        tr_capture_tap(e->capture, if_slot, TR_CAP_RX, mbufs[i]);
+    uint64_t bytes = 0;
+    for (uint16_t i = 0; i < n; i++)
+        bytes += mlen(mbufs[i]);
     pthread_rwlock_rdlock(&e->rt_lock);
     rt = e->rt;
-    stats_rx(e, worker, if_slot, mlen(m));
-    engine_input_slot(e, worker, rt, if_slot, m);
+    for (uint16_t i = 0; i < n; i++) {
+        if (i + 1 < n)
+            rte_prefetch0(rte_pktmbuf_mtod(mbufs[i + 1], void *));
+        engine_input_slot(e, worker, rt, if_slot, mbufs[i]);
+    }
     pthread_rwlock_unlock(&e->rt_lock);
+    stats_rx_bulk(e, worker, if_slot, n, bytes);
     return 0;
+}
+
+int tr_engine_input(struct tr_engine *e, int worker, int if_slot,
+                    struct rte_mbuf *m)
+{
+    return tr_engine_input_burst(e, worker, if_slot, &m, 1);
 }
 
 

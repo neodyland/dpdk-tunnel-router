@@ -16,10 +16,18 @@
 
 #define TR_PORT_MAX 256
 #define TR_IFACE_MAX TR_MAX_IFACES
-#define TR_RX_BURST 32
+#define TR_RX_BURST 64
+#define TR_TX_BURST 32
 #define TR_RX_DESC 512
 #define TR_TX_DESC 512
 #define TR_PORT_MTU_MAX 9600
+
+struct tr_tx_batch {
+    uint16_t port;
+    uint16_t q;
+    uint16_t n;
+    struct rte_mbuf *m[TR_TX_BURST];
+};
 
 struct tr_dpdk {
     struct tr_engine *engine;
@@ -30,9 +38,29 @@ struct tr_dpdk {
     _Atomic int slot_port[TR_IFACE_MAX];
     int port_nq[TR_PORT_MAX];
     _Atomic bool stop;
+    _Atomic bool workers_running;
+    struct tr_tx_batch tx[TR_MAX_WORKERS][TR_PORT_MAX];
     bool started;
     int lcores[TR_MAX_WORKERS];
 };
+
+static void tx_flush_batch(struct tr_dpdk *d, struct tr_tx_batch *b)
+{
+    if (b->n == 0)
+        return;
+    uint16_t sent = rte_eth_tx_burst(b->port, b->q, b->m, b->n);
+    for (uint16_t i = sent; i < b->n; i++)
+        rte_pktmbuf_free(b->m[i]);
+    b->n = 0;
+}
+
+static void tx_flush_all(struct tr_dpdk *d, int worker)
+{
+    if (worker < 0 || worker >= d->workers)
+        return;
+    for (int port = 0; port < d->nports; port++)
+        tx_flush_batch(d, &d->tx[worker][port]);
+}
 
 static void tx_burst(void *arg, int worker, int if_slot, struct rte_mbuf *m)
 {
@@ -52,8 +80,23 @@ static void tx_burst(void *arg, int worker, int if_slot, struct rte_mbuf *m)
         return;
     }
     q = worker % (d->port_nq[port] > 0 ? d->port_nq[port] : 1);
-    if (rte_eth_tx_burst((uint16_t)port, (uint16_t)q, &m, 1) != 1)
+    if (!atomic_load_explicit(&d->workers_running, memory_order_relaxed)) {
+        if (rte_eth_tx_burst((uint16_t)port, (uint16_t)q, &m, 1) != 1)
+            rte_pktmbuf_free(m);
+        return;
+    }
+    if (worker < 0 || worker >= d->workers) {
         rte_pktmbuf_free(m);
+        return;
+    }
+    struct tr_tx_batch *b = &d->tx[worker][port];
+    if (b->n > 0 && (b->port != (uint16_t)port || b->q != (uint16_t)q))
+        tx_flush_batch(d, b);
+    b->port = (uint16_t)port;
+    b->q = (uint16_t)q;
+    b->m[b->n++] = m;
+    if (b->n == TR_TX_BURST)
+        tx_flush_batch(d, b);
 }
 
 int tr_dpdk_refresh(struct tr_dpdk *d)
@@ -233,6 +276,7 @@ struct tr_dpdk *tr_dpdk_create(struct tr_engine *engine,
     if (d->nports > TR_PORT_MAX)
         d->nports = TR_PORT_MAX;
     atomic_store(&d->stop, false);
+    atomic_store(&d->workers_running, false);
     for (int i = 0; i < TR_PORT_MAX; i++)
         atomic_store(&d->port_slot[i], -1);
     for (int i = 0; i < TR_IFACE_MAX; i++)
@@ -301,12 +345,15 @@ static int worker_main(void *arg)
             if (!n)
                 continue;
             did_work = true;
-            for (uint16_t i = 0; i < n; i++)
-                tr_engine_input(d->engine, worker, if_slot, bufs[i]);
+            tr_engine_input_burst(d->engine, worker, if_slot, bufs, n);
+            tx_flush_all(d, worker);
         }
-        if (!did_work)
+        if (!did_work) {
+            tx_flush_all(d, worker);
             rte_delay_us_block(20);
+        }
     }
+    tx_flush_all(d, worker);
     return 0;
 }
 
@@ -317,6 +364,7 @@ int tr_dpdk_launch_workers(struct tr_dpdk *d)
     static struct worker_arg args[TR_MAX_WORKERS];
     int rc = 0;
 
+    atomic_store_explicit(&d->workers_running, true, memory_order_release);
     for (int i = 0; i < d->workers; i++) {
         args[i].d = d;
         args[i].worker = i;
@@ -326,6 +374,9 @@ int tr_dpdk_launch_workers(struct tr_dpdk *d)
             break;
         }
     }
+    if (rc)
+        atomic_store_explicit(&d->workers_running, false,
+                              memory_order_release);
     return rc;
 }
 
@@ -340,6 +391,7 @@ void tr_dpdk_stop(struct tr_dpdk *d)
             continue;
         rte_eal_wait_lcore(lcore);
     }
+    atomic_store_explicit(&d->workers_running, false, memory_order_release);
     for (int port = 0; port < d->nports; port++)
         rte_eth_dev_stop((uint16_t)port);
     d->started = false;

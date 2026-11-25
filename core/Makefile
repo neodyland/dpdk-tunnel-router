@@ -13,13 +13,14 @@ SRC     := $(wildcard src/*.c)
 OBJS    := $(patsubst src/%.c,$(OBJ)/%.o,$(SRC))
 TEST_SRC:= $(wildcard tests/*.c)
 TESTS   := $(patsubst tests/%.c,$(BUILD)/%,$(TEST_SRC))
+BENCH   := $(BUILD)/engine_bench
 
-CFLAGS  ?= -O2 -g
+CFLAGS  ?= -O3 -g
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wshadow -Wformat=2 -Wno-unused-parameter \
            -D_GNU_SOURCE -pthread -Isrc $(DPDK_CFLAGS)
 LDFLAGS += $(DPDK_LIBS) -pthread -ldl -lm
 
-.PHONY: all clean test tests
+.PHONY: all clean test tests bench
 all: $(BIN)
 
 $(OBJ)/%.o: src/%.c
@@ -39,6 +40,14 @@ $(BUILD)/%: tests/%.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
 
 tests: $(TESTS)
+
+$(BENCH): bench/engine_bench.c $(LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+bench: $(BENCH)
+	@mkdir -p $(ROOT)/run $(ROOT)/tmp
+	XDG_RUNTIME_DIR=$(ROOT)/run TMPDIR=$(ROOT)/tmp $(BENCH)
 
 test: $(TESTS)
 	@mkdir -p $(ROOT)/run $(ROOT)/tmp
