@@ -24,7 +24,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifndef TR_VERSION
 #define TR_VERSION "1.0.0"
+#endif
 #define TR_POOL_SIZE 8192
 #define TR_PKT_ROOM 10240
 

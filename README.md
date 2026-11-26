@@ -614,6 +614,69 @@ make test
   ping、show neighbors の MAC テーブル、永続化、再起動、ホット追加、
   Rust プラグインのロードを確認。
 
+### Debian パッケージ
+
+ビルド済みバイナリを `.deb` にまとめられます。
+
+```sh
+make
+VERSION=1.2.3 ./scripts/build-deb.sh
+```
+
+または:
+
+```sh
+make deb VERSION=1.2.3
+```
+
+生成物:
+
+```text
+dist/dpdk-tunnel-router_1.2.3-1_amd64.deb
+```
+
+インストール:
+
+```sh
+sudo apt install ./dist/dpdk-tunnel-router_1.2.3-1_amd64.deb
+```
+
+インストール先:
+
+```text
+/usr/sbin/dpdk-tunnel-router
+/usr/bin/routerctl
+/usr/lib/dpdk-tunnel-router/libtunnel_driver.so
+/etc/dpdk-tunnel-router/main.conf
+/usr/share/doc/dpdk-tunnel-router/
+```
+
+パッケージは Ubuntu 24.04 の DPDK 23.11 ランタイム
+(`librte-meta-all`) を前提にビルドします。GitHub Actions の配布物は
+Ubuntu 24.04 / DPDK 23.11 で生成され、`-march=x86-64-v2` でビルドされます。
+ローカルで `make deb` した場合は、そのホストの DPDK にリンクされます。
+`--plugin` で Rust プラグインを読み込む場合は次を指定してください。
+
+```sh
+--plugin /usr/lib/dpdk-tunnel-router/libtunnel_driver.so
+```
+
+#### GitHub Actions で Release
+
+`v1.2.3` 形式のタグを push すると、Ubuntu 24.04 上でビルド・テスト・
+`.deb` 作成を行い、GitHub Release に添付します。
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+ワークフロー: [.github/workflows/release.yml](.github/workflows/release.yml)
+
+- `make test` 成功時のみ Release を作成
+- `.deb` と `SHA256SUMS` を添付
+- `workflow_dispatch` でも手動ビルド可能（Release はタグ時のみ）
+
 ### VM で全テストを実行
 
 ホストでビルドしたテストバイナリとランタイムライブラリを initramfs に詰め、

@@ -1,4 +1,5 @@
 # C data plane build
+VERSION ?= 1.0.0
 CC      ?= gcc
 PKG     ?= pkg-config
 DPDK_CFLAGS ?= $(shell $(PKG) --cflags libdpdk)
@@ -17,7 +18,7 @@ BENCH   := $(BUILD)/engine_bench
 
 CFLAGS  ?= -O3 -g
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wshadow -Wformat=2 -Wno-unused-parameter \
-           -D_GNU_SOURCE -pthread -Isrc $(DPDK_CFLAGS)
+           -D_GNU_SOURCE -DTR_VERSION=\"$(VERSION)\" -pthread -Isrc $(DPDK_CFLAGS)
 LDFLAGS += $(DPDK_LIBS) -pthread -ldl -lm
 
 .PHONY: all clean test tests bench

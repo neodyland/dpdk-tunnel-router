@@ -5,11 +5,14 @@
 #   make clean
 
 SHELL := /bin/bash
+VERSION ?= 1.0.0
+export VERSION
+
 ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 CARGO := $(ROOT)/scripts/cargo.sh
 BUILD := $(ROOT)/build
 
-.PHONY: all core rust rust-lib cli test core-test rust-test smoke vm-test bench clean install
+.PHONY: all core rust rust-lib cli test core-test rust-test smoke vm-test bench deb clean install
 .PHONY: distclean
 
 all: core rust
@@ -42,6 +45,9 @@ vm-test: all
 
 bench: core
 	$(MAKE) -C core bench
+
+deb:
+	./scripts/build-deb.sh
 
 install: all
 	install -D -m 0755 $(BUILD)/core/dpdk-tunnel-router $(DESTDIR)/usr/local/sbin/dpdk-tunnel-router
