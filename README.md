@@ -215,8 +215,9 @@ Backspace / Delete で編集できます。Ctrl-L で画面クリア、Ctrl-C �
   `commit` と `save` を済ませるか、`discard` してから抜けてください。
 - configuration モードの `show configuration` / `show interfaces` は
   candidate を表示します。`show running-config` は現在の running を表示します。
-  `show routes` / `neighbors` / `bridge` / `statistics` などの運用表示は
-  running のデータプレーンを参照します。
+  `show route <IPv4|IPv6>` は最長一致の経路詳細、`show routes` /
+  `neighbors` / `bridge` / `statistics` などの運用表示は running の
+  データプレーンを参照します。
 - candidate は制御セッション（Unix ソケット接続）ごとにコアが保持します。
   切断すると未保存の candidate は破棄されます。
 - コア起動時に `--no-persist` を指定した場合、`commit` は running に反映しますが
@@ -330,6 +331,19 @@ interface  Ethernet/VLAN egress
 `interface` は link-local IPv6 や、FIB を使わず特定ポートへ送る場合に指定します。
 ping は running（commit 済み）の FIB / インタフェースを使います。
 
+`show route` / `show route all` / `show routes` は全経路を一覧表示します。
+`show route <IPv4|IPv6|prefix>` は最長一致した経路のプレフィックス、種別、
+via、egress、解決済み next-hop を表示します。
+
+```text
+Destination: 203.0.113.5
+Matched prefix: 203.0.113.0/24
+Route type: static
+Via: 10.0.0.254
+Egress: eth1 (ifindex 1)
+Next-hop: 10.0.0.254
+```
+
 `show neighbors` は ARP/NDP エントリに加えて、ブリッジの L2 MAC テーブルも
 表示します。
 
@@ -405,6 +419,7 @@ delete protocols static route <prefix>
 ```text
 show configuration
 show interfaces [name]
+show route [IPv4|IPv6|all]
 show routes
 show neighbors
 show bridge

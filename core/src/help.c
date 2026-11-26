@@ -663,6 +663,7 @@ static void show_help(FILE *f)
             "  show interfaces [name]     logical interfaces, addresses, MAC,\n"
             "                             VLAN children, runtime IPv6\n"
             "  show routes                FIB (connected/static/SLAAC)\n"
+            "  show route [IPv4|IPv6|all] all routes, or the best match\n"
             "  show neighbors             ARP/NDP entries and the L2 MAC table\n"
             "  show bridge                learned MAC table\n"
             "  show statistics            per-interface counters\n"

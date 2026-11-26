@@ -102,6 +102,12 @@ expect_contains "$show" "address ipv6 autoconf" "VLAN autoconf"
 routes=$(ctl show routes)
 expect_contains "$routes" "192.0.2.0/24" "connected IPv4 route"
 expect_contains "$routes" "0.0.0.0/0" "default route"
+all_routes=$(ctl show route)
+expect_contains "$all_routes" "192.0.2.0/24" "show route all connected"
+expect_contains "$all_routes" "0.0.0.0/0" "show route all default"
+route_lookup=$(ctl show route 8.8.8.8)
+expect_contains "$route_lookup" "Matched prefix: 0.0.0.0/0" "show route default"
+expect_contains "$route_lookup" "Next-hop: 192.0.2.254" "show route next-hop"
 
 conf=$(ctl show configuration)
 expect_contains "$conf" "set interfaces tunnel tun0 remote 2001:db8:2::2" "configuration"

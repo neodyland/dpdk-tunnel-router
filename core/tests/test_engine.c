@@ -420,6 +420,14 @@ static int test_ipv4_route(struct rte_mempool *mp, struct capture *cap)
     CHECK(cap->m[0]->l3_len == 20);
     CHECK(p[24] == 0 && p[25] == 0);
     tr_engine_set_tx_ipv4_cksum(e, false);
+
+    char *route = NULL;
+    CHECK(tr_engine_show(e, 2, (char *[]){"route", "198.51.100.2"},
+                         &route) == 0);
+    CHECK(strstr(route, "Matched prefix: 198.51.100.0/24") != NULL);
+    CHECK(strstr(route, "Egress: eth1") != NULL);
+    CHECK(strstr(route, "Next-hop: directly connected") != NULL);
+    free(route);
     capture_reset(cap);
     tr_engine_destroy(e);
     (void)bcast;

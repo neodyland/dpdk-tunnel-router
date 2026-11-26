@@ -2960,37 +2960,129 @@ int tr_engine_stats_text(struct tr_engine *e, char **out)
     return 0;
 }
 
+static int resolve_show_route(const struct tr_fib *fib, const struct tr_ip *addr,
+                              int depth, int *if_slot, struct tr_ip *next_hop)
+{
+    struct tr_fib_result res;
+
+    if (depth > 8 || tr_fib_lookup(fib, addr, &res))
+        return -1;
+    if (res.route->connected) {
+        *if_slot = res.route->if_slot;
+        *next_hop = *addr;
+        return 0;
+    }
+    if (!res.route->has_via)
+        return -1;
+    if (depth == 0)
+        *next_hop = res.route->via;
+    return resolve_show_route(fib, &res.route->via, depth + 1, if_slot,
+                              next_hop);
+}
+
+static int show_route_table(struct tr_engine *e, char **out)
+{
+    char *buf = NULL;
+    size_t n = 0;
+    FILE *f = open_memstream(&buf, &n);
+
+    if (!f)
+        return -1;
+    pthread_rwlock_rdlock(&e->rt_lock);
+    for (int i = 0; i < e->rt->fib.nroutes; i++) {
+        const struct tr_fib_route *r = &e->rt->fib.routes[i];
+        char pfx[96], via[96];
+        tr_prefix_ntop(&r->prefix, pfx, sizeof(pfx));
+        if (r->has_via)
+            tr_ip_ntop(&r->via, via, sizeof(via));
+        else
+            snprintf(via, sizeof(via), "-");
+        const struct tr_iface *iface = rt_iface(e->rt, r->if_slot);
+        fprintf(f, "%-42s via %-42s %s%s\n", pfx, via,
+                iface ? iface->name : "-",
+                r->connected ? " connected" : "");
+    }
+    pthread_rwlock_unlock(&e->rt_lock);
+    fclose(f);
+    *out = buf;
+    return 0;
+}
+
 int tr_engine_show(struct tr_engine *e, int argc, char **argv, char **out)
 {
     if (!e || !argc || !argv || !out)
         return -1;
     if (strcmp(argv[0], "statistics") == 0)
         return tr_engine_stats_text(e, out);
-    if (strcmp(argv[0], "routes") == 0) {
+    if (strcmp(argv[0], "route") == 0) {
+        if (argc < 2 || strcmp(argv[1], "all") == 0)
+            return show_route_table(e, out);
+        struct tr_ip dst;
+        const char *arg = argv[1];
+        if (strchr(arg, '/')) {
+            struct tr_prefix pfx;
+            if (tr_prefix_parse_host(arg, &pfx))
+                return -1;
+            dst = pfx.addr;
+        } else if (tr_ip_parse(arg, &dst)) {
+            return -1;
+        }
         char *buf = NULL;
         size_t n = 0;
         FILE *f = open_memstream(&buf, &n);
         if (!f)
             return -1;
         pthread_rwlock_rdlock(&e->rt_lock);
-        for (int i = 0; i < e->rt->fib.nroutes; i++) {
-            const struct tr_fib_route *r = &e->rt->fib.routes[i];
-            char pfx[96], via[96];
-            tr_prefix_ntop(&r->prefix, pfx, sizeof(pfx));
-            if (r->has_via)
-                tr_ip_ntop(&r->via, via, sizeof(via));
-            else
-                snprintf(via, sizeof(via), "-");
+        struct tr_fib_result res;
+        char dstbuf[96], pfxbuf[96], viabuf[96], nhbuf[96];
+        tr_ip_ntop(&dst, dstbuf, sizeof(dstbuf));
+        if (tr_fib_lookup(&e->rt->fib, &dst, &res)) {
+            fprintf(f, "Destination: %s\nNo matching route\n", dstbuf);
+        } else {
+            const struct tr_fib_route *r = res.route;
             const struct tr_iface *iface = rt_iface(e->rt, r->if_slot);
-            fprintf(f, "%-42s via %-42s %s%s\n", pfx, via,
-                    iface ? iface->name : "-",
-                    r->connected ? " connected" : "");
+            tr_prefix_ntop(&r->prefix, pfxbuf, sizeof(pfxbuf));
+            const char *kind = r->connected ? "connected"
+                               : r->route_id <= -10000 ? "dynamic (RA/SLAAC)"
+                                                      : "static";
+            fprintf(f, "Destination: %s\nMatched prefix: %s\n"
+                       "Route type: %s\n",
+                    dstbuf, pfxbuf, kind);
+            if (r->has_via) {
+                tr_ip_ntop(&r->via, viabuf, sizeof(viabuf));
+                fprintf(f, "Via: %s\n", viabuf);
+            }
+            int egress = r->if_slot;
+            struct tr_ip nh;
+            bool have_nh = false;
+            if (resolve_show_route(&e->rt->fib, &dst, 0, &egress, &nh) == 0) {
+                tr_ip_ntop(&nh, nhbuf, sizeof(nhbuf));
+                have_nh = true;
+                iface = rt_iface(e->rt, egress);
+            }
+            if (iface)
+                fprintf(f, "Egress: %s (ifindex %d)\n", iface->name,
+                        iface->slot);
+            else
+                fprintf(f, "Egress: unresolved\n");
+            if (have_nh) {
+                if (r->connected || (!r->has_via && egress == r->if_slot))
+                    fprintf(f, "Next-hop: directly connected\n");
+                else
+                    fprintf(f, "Next-hop: %s\n", nhbuf);
+            } else if (r->has_via) {
+                fprintf(f, "Next-hop: unresolved\n");
+            } else {
+                fprintf(f, "Next-hop: directly connected\n");
+            }
         }
         pthread_rwlock_unlock(&e->rt_lock);
         fclose(f);
         *out = buf;
         return 0;
     }
+    if (strcmp(argv[0], "routes") == 0)
+        return show_route_table(e, out);
     if (strcmp(argv[0], "neighbors") == 0) {
         char *n4 = NULL, *n6 = NULL, *mac = NULL, *buf = NULL;
         size_t n = 0;

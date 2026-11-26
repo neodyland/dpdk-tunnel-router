@@ -178,9 +178,8 @@ static int resolve_via(const struct tr_fib *fib, const struct tr_ip *via,
         *next_hop = *via;
         return 0;
     }
-    if (!res.route->has_via || res.route->if_slot < 0)
+    if (!res.route->has_via)
         return -1;
-    *if_slot = res.route->if_slot;
     if (depth == 0)
         *next_hop = *via;
     return resolve_via(fib, &res.route->via, depth + 1, if_slot, next_hop);
