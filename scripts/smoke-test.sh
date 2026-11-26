@@ -140,11 +140,42 @@ if ctl show interfaces | grep -q 'eth0 (ethernet, mtu 1400'; then
     exit 1
 fi
 
-# Configuration mode: candidate + save.
-printf 'configure\nset interfaces ethernet eth0 address 203.0.113.1/24\nsave\nread\n' |
+# save without commit must be rejected and must not touch the data plane.
+if printf 'configure\nset interfaces ethernet eth0 address 203.0.113.1/24\nsave\n' |
+    "$CLI" --socket "$SOCK" --quiet >/dev/null 2>&1; then
+    echo "smoke: save without commit succeeded" >&2
+    exit 1
+fi
+if ctl show interfaces | grep -q '203.0.113.1/24'; then
+    echo "smoke: uncommitted candidate was applied" >&2
+    exit 1
+fi
+
+# Configuration mode: commit applies, save persists.
+printf 'configure\nset interfaces ethernet eth0 address 203.0.113.1/24\ncommit\nsave\nread\n' |
     "$CLI" --socket "$SOCK" --quiet
 ctl show interfaces | grep -q '203.0.113.1/24' || {
-    echo "smoke: candidate save did not apply" >&2
+    echo "smoke: committed candidate was not applied" >&2
+    exit 1
+}
+
+# commit reflects the running data plane but must not write the config file.
+if printf 'configure\nset interfaces ethernet eth0 address 203.0.113.5/24\ncommit\n' |
+    "$CLI" --socket "$SOCK" --quiet >/dev/null 2>&1; then
+    echo "smoke: commit-only exit succeeded" >&2
+    exit 1
+fi
+ctl show interfaces | grep -q '203.0.113.5/24' || {
+    echo "smoke: commit did not reach running state" >&2
+    exit 1
+}
+if grep -q '203.0.113.5/24' "$CONF"; then
+    echo "smoke: commit wrote the configuration file" >&2
+    exit 1
+fi
+printf 'configure\nsave\nexit\n' | "$CLI" --socket "$SOCK" --quiet
+grep -q '203.0.113.5/24' "$CONF" || {
+    echo "smoke: save did not persist running configuration" >&2
     exit 1
 }
 
@@ -156,7 +187,7 @@ if ctl show interfaces | grep -q '203.0.113.2/24'; then
     exit 1
 fi
 
-# Leaving configuration mode with unsaved changes must fail.
+# Leaving configuration mode with uncommitted changes must fail.
 if printf 'configure\nset interfaces ethernet eth0 address 203.0.113.3/24\nexit\n' |
     "$CLI" --socket "$SOCK" --quiet >/dev/null 2>&1; then
     echo "smoke: dirty candidate exit succeeded" >&2
@@ -167,7 +198,7 @@ if ctl show interfaces | grep -q '203.0.113.3/24'; then
     exit 1
 fi
 
-# --file is one configure/save transaction.
+# --file is one configure/commit/save transaction.
 cat >"$RUN/smoke-batch.conf" <<'BATCH'
 set interfaces ethernet eth0 address 203.0.113.4/24
 BATCH

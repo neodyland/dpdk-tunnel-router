@@ -4,11 +4,12 @@
 //!
 //! * **read mode** — `show` commands and navigation;
 //! * **configuration mode** — `set` / `delete` edit a candidate held by the
-//!   core session, and `save` installs and persists it.
+//!   core session; `commit` applies it to the running data plane and `save`
+//!   persists the running configuration.
 //!
 //! A one-shot `routerctl set ...` is a convenience transaction: it enters
-//! configuration mode, edits, saves, and leaves.  Interactive use exposes the
-//! modes explicitly.
+//! configuration mode, edits, commits, saves, and leaves.  Interactive use
+//! exposes the modes explicitly.
 
 use std::env;
 use std::ffi::c_void;
@@ -40,14 +41,16 @@ fn usage(prog: &str) {
          Interactive use starts in read mode:\n\
          \x20 router> configure\n\
          \x20 router(config)> set interfaces ethernet eth0 address 192.0.2.1/24\n\
+         \x20 router(config)> commit\n\
          \x20 router(config)> save\n\
          \x20 router(config)> exit\n\
          \x20 router> show interfaces\n\
          \n\
          Read mode accepts show/help/configure/exit.  Configuration mode\n\
-         accepts set, delete/del, save/commit, discard/rollback, show and\n\
-         read/exit.  Exiting with unsaved changes is refused; use save or\n\
-         discard first.\n\
+         accepts set, delete/del, commit, save, discard/rollback, show and\n\
+         read/exit.  commit applies the candidate to the running data plane;\n\
+         save writes the running configuration to disk.\n\
+         Exiting with uncommitted or unsaved changes is refused.\n\
          \n\
          Context help: end a command with ? or use 'help <path>'.\n\
          \x20 {prog} set interfaces ethernet eth1 '?'\n\
@@ -60,8 +63,8 @@ fn usage(prog: &str) {
          \x20 {prog} tcpdump status\n\
          \x20 {prog} tcpdump stop\n\
          \n\
-         One-shot set/delete is a complete configure + save transaction.\n\
-         --file applies a command file as one configure + save transaction.\n\
+         One-shot set/delete is a complete configure + commit + save\n\
+         transaction.  --file applies a command file the same way.\n\
          \n\
          Examples:\n\
          \x20 {prog} show status\n\
@@ -279,7 +282,7 @@ fn is_mode_command(line: &str) -> bool {
     )
 }
 
-/// Run a batch as one candidate transaction: configure, edits, save, exit.
+/// Run a batch as one transaction: configure, edits, commit, save, exit.
 fn run_transaction(client: &mut Client, commands: &[String], quiet: bool) -> bool {
     match client.execute("configure") {
         Ok(resp) if resp.ok => {}
@@ -307,22 +310,24 @@ fn run_transaction(client: &mut Client, commands: &[String], quiet: bool) -> boo
             }
         }
     }
-    match client.execute("save") {
-        Ok(resp) if resp.ok => {
-            if !quiet {
-                print!("{}", resp.body);
-                let _ = io::stdout().flush();
+    for command in ["commit", "save"] {
+        match client.execute(command) {
+            Ok(resp) if resp.ok => {
+                if !quiet {
+                    print!("{}", resp.body);
+                    let _ = io::stdout().flush();
+                }
             }
-        }
-        Ok(resp) => {
-            print_error_body(&resp);
-            let _ = client.execute("discard");
-            let _ = client.execute("exit");
-            return false;
-        }
-        Err(e) => {
-            eprintln!("routerctl: {e}");
-            return false;
+            Ok(resp) => {
+                print_error_body(&resp);
+                let _ = client.execute("discard");
+                let _ = client.execute("exit");
+                return false;
+            }
+            Err(e) => {
+                eprintln!("routerctl: {e}");
+                return false;
+            }
         }
     }
     let _ = client.execute("exit");

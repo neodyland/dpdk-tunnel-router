@@ -139,10 +139,12 @@ static void general_help(FILE *f, bool config_mode)
         fprintf(f, "  delete ... | del ...       remove candidate objects\n");
         fprintf(f, "  show configuration         show candidate\n");
         fprintf(f, "  show running-config        show active configuration\n");
-        fprintf(f, "  save | commit              apply and persist candidate\n");
+        fprintf(f, "  commit                     apply candidate to running\n");
+        fprintf(f, "  save                       persist running configuration\n");
         fprintf(f, "  discard | rollback         discard candidate changes\n");
         fprintf(f, "  read | exit | end          return to read mode\n\n");
-        fprintf(f, "Unsaved changes cannot be left with exit/read.\n");
+        fprintf(f, "Uncommitted or unsaved changes cannot be left with "
+                   "exit/read.\n");
     }
 }
 
@@ -710,13 +712,19 @@ static void delete_help(FILE *f)
 
 static void mode_command_help(FILE *f, const char *cmd)
 {
-    if (strcmp(cmd, "save") == 0 || strcmp(cmd, "commit") == 0)
+    if (strcmp(cmd, "commit") == 0)
         fprintf(f,
-                "save / commit\n\n"
-                "Applies the candidate configuration to the data plane and\n"
-                "atomically writes the running configuration file.\n"
-                "If validation or file write fails, the running state is\n"
-                "rolled back and the candidate remains dirty.\n"
+                "commit\n\n"
+                "Validates the candidate and installs it into the running\n"
+                "data plane.  The configuration file is not written.\n"
+                "The candidate becomes clean; use 'save' to persist.\n"
+                "Available only in configuration mode.\n");
+    else if (strcmp(cmd, "save") == 0)
+        fprintf(f,
+                "save\n\n"
+                "Atomically writes the current running configuration to\n"
+                "the configuration file.  Uncommitted candidate changes\n"
+                "must be committed first.\n"
                 "Available only in configuration mode.\n");
     else if (strcmp(cmd, "discard") == 0 || strcmp(cmd, "rollback") == 0)
         fprintf(f,
@@ -728,15 +736,16 @@ static void mode_command_help(FILE *f, const char *cmd)
         fprintf(f,
                 "configure\n\n"
                 "Enters configuration mode and copies the running config\n"
-                "into a per-session candidate.  Exit with 'read', 'exit', or\n"
-                "'end'; unsaved changes are refused.\n");
+                "into a per-session candidate.  Use 'commit' to apply and\n"
+                "'save' to persist; uncommitted or unsaved changes are\n"
+                "refused when leaving.\n");
     else if (strcmp(cmd, "read") == 0 || strcmp(cmd, "end") == 0 ||
              strcmp(cmd, "exit") == 0)
         fprintf(f,
                 "read / end / exit\n\n"
-                "Leaves configuration mode.  If the candidate has unsaved\n"
-                "changes, use 'save' or 'discard' first; otherwise the exit\n"
-                "is refused.\n");
+                "Leaves configuration mode.  If the candidate has uncommitted\n"
+                "changes, commit or discard first.  If the running config is\n"
+                "not saved, save first; otherwise the exit is refused.\n");
 }
 
 int tr_help_command(const struct tr_config *cfg, int nports, bool config_mode,

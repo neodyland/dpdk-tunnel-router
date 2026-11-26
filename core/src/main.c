@@ -41,6 +41,7 @@ struct app {
     bool persist;
     bool allow_no_ports;
     uint64_t revision;
+    uint64_t saved_revision;
 };
 
 struct cli_session {
@@ -347,15 +348,28 @@ static int edit_candidate(struct app *a, struct cli_session *s, int argc,
     return body_msg(body, "Candidate updated.\n");
 }
 
+static int session_can_leave(struct app *a, struct cli_session *s,
+                             char **error_text)
+{
+    if (s->dirty)
+        return fail_msg(error_text,
+                        "uncommitted changes; use 'commit' or 'discard' "
+                        "first\n");
+    if (a->persist && a->revision != a->saved_revision)
+        return fail_msg(error_text,
+                        "running configuration is not saved; use 'save' "
+                        "first\n");
+    return 0;
+}
+
 static int commit_candidate(struct app *a, struct cli_session *s, char **body,
                             char **error_text)
 {
-    struct tr_config working, old;
+    struct tr_config working;
     char err[512];
-    char save_err[256];
 
     if (!s->dirty)
-        return body_msg(body, "No changes to save.\n");
+        return body_msg(body, "No changes to commit.\n");
     if (s->base_revision != a->revision) {
         return fail_msg(error_text,
                         "running configuration changed in another session; "
@@ -365,25 +379,36 @@ static int commit_candidate(struct app *a, struct cli_session *s, char **body,
     apply_port_macs(&working, a->nports);
     if (tr_config_validate(&working, &a->env, err, sizeof(err)))
         return fail_msg(error_text, "%s\n", err[0] ? err : "configuration error");
-    if (tr_engine_config_copy(a->engine, &old))
-        return fail_msg(error_text, "cannot read running configuration\n");
     if (tr_engine_apply(a->engine, &working, err, sizeof(err)))
         return fail_msg(error_text, "%s\n", err[0] ? err : "apply failed");
     tr_dpdk_refresh(a->dpdk);
-    if (a->persist &&
-        tr_config_save(&working, a->config_path, save_err, sizeof(save_err))) {
-        tr_engine_apply(a->engine, &old, err, sizeof(err));
-        tr_dpdk_refresh(a->dpdk);
-        return fail_msg(error_text, "cannot save configuration: %s\n",
-                        save_err);
-    }
     a->revision++;
     s->base_revision = a->revision;
     s->dirty = false;
     tr_config_copy(&s->candidate, &working);
-    if (a->persist)
-        return body_msg(body, "Configuration saved.\n");
-    return body_msg(body, "Configuration applied (persistence disabled).\n");
+    return body_msg(body, "Configuration committed (not saved).\n");
+}
+
+static int save_running(struct app *a, struct cli_session *s, char **body,
+                        char **error_text)
+{
+    struct tr_config running;
+    char err[256];
+    uint64_t saving_revision;
+
+    if (!a->persist)
+        return fail_msg(error_text,
+                        "persistence is disabled (--no-persist)\n");
+    if (s->dirty)
+        return fail_msg(error_text,
+                        "uncommitted changes; commit them before save\n");
+    saving_revision = a->revision;
+    if (tr_engine_config_copy(a->engine, &running))
+        return fail_msg(error_text, "cannot read running configuration\n");
+    if (tr_config_save(&running, a->config_path, err, sizeof(err)))
+        return fail_msg(error_text, "cannot save configuration: %s\n", err);
+    a->saved_revision = saving_revision;
+    return body_msg(body, "Configuration saved.\n");
 }
 
 static int capture_command(struct app *a, int argc, char **argv, char **body,
@@ -611,9 +636,8 @@ static int control_execute(void *arg, void *session, const char *line,
     if (strcmp(argv[0], "read") == 0) {
         if (!s->config_mode) {
             rc = body_msg(body, "Already in read mode.\n");
-        } else if (s->dirty) {
-            rc = fail_msg(error_text,
-                          "unsaved changes; use 'save' or 'discard' first\n");
+        } else if (session_can_leave(a, s, error_text)) {
+            rc = -1;
         } else {
             s->config_mode = false;
             rc = body_msg(body, "Read mode.\n");
@@ -623,21 +647,28 @@ static int control_execute(void *arg, void *session, const char *line,
     if (strcmp(argv[0], "exit") == 0 || strcmp(argv[0], "end") == 0) {
         if (!s->config_mode) {
             rc = body_msg(body, "Bye.\n");
-        } else if (s->dirty) {
-            rc = fail_msg(error_text,
-                          "unsaved changes; use 'save' or 'discard' first\n");
+        } else if (session_can_leave(a, s, error_text)) {
+            rc = -1;
         } else {
             s->config_mode = false;
             rc = body_msg(body, "Exiting configuration mode.\n");
         }
         goto out;
     }
-    if (strcmp(argv[0], "save") == 0 || strcmp(argv[0], "commit") == 0) {
+    if (strcmp(argv[0], "commit") == 0) {
+        if (!s->config_mode)
+            rc = fail_msg(error_text,
+                          "commit is only available in configuration mode\n");
+        else
+            rc = commit_candidate(a, s, body, error_text);
+        goto out;
+    }
+    if (strcmp(argv[0], "save") == 0) {
         if (!s->config_mode)
             rc = fail_msg(error_text,
                           "save is only available in configuration mode\n");
         else
-            rc = commit_candidate(a, s, body, error_text);
+            rc = save_running(a, s, body, error_text);
         goto out;
     }
     if (strcmp(argv[0], "discard") == 0 ||
@@ -684,9 +715,8 @@ static int control_execute(void *arg, void *session, const char *line,
         goto out;
     }
     if (strcmp(argv[0], "quit") == 0) {
-        if (s->config_mode && s->dirty) {
-            rc = fail_msg(error_text,
-                          "unsaved changes; use 'save' or 'discard' first\n");
+        if (s->config_mode && session_can_leave(a, s, error_text)) {
+            rc = -1;
         } else {
             s->config_mode = false;
             rc = body_msg(body, "Bye.\n");
@@ -866,6 +896,7 @@ int main(int argc, char **argv)
                                       sizeof(err)))
         fprintf(stderr, "warning: cannot save %s: %s\n", app.config_path,
                 err);
+    app.saved_revision = app.revision;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);

@@ -191,7 +191,8 @@ router> configure
 router(config)> set interfaces ethernet eth0 address 192.0.2.1/24
 router(config)> set interfaces tunnel tun0 remote 2001:db8:1::2
 router(config)> show configuration        # candidate を表示
-router(config)> save                      # 適用 + 永続化
+router(config)> commit                    # running に反映
+router(config)> save                      # 設定ファイルへ保存
 router(config)> exit
 router> show interfaces                   # running を表示
 ```
@@ -201,24 +202,27 @@ Backspace / Delete で編集できます。Ctrl-L で画面クリア、Ctrl-C �
 行をキャンセル、Ctrl-D で終了します。履歴は CLI セッション内で保持されます。
 
 - **read モード** (`router>`): `show` / `help` / `configure` / `exit`。
-  `set` / `delete` / `save` / `discard` は拒否されます。
+  `set` / `delete` / `commit` / `save` / `discard` は拒否されます。
 - **configuration モード** (`router(config)>`): `set` / `delete` / `del` で
-  candidate を編集します。`save` または `commit` で running に適用し、
-  `--config` のファイルへ原子的に保存します。`read` / `exit` / `end` で
-  read モードへ戻ります。
+  candidate を編集します。
+  - `commit`: candidate を検証し、running のデータプレーンへ反映
+  - `save`: 現在の running を `--config` のファイルへ原子的に保存
+  - `read` / `exit` / `end` で read モードへ戻ります。
 - `discard` / `rollback` で candidate を running に戻します。
-- 未保存の変更がある状態で `exit` / `end` / `quit` すると拒否されます。
-  `save` するか `discard` してから抜けてください。
+- 未 commit の candidate、または commit 後未 save の running がある状態で
+  `exit` / `end` / `quit` / `read` すると拒否されます。
+  `commit` と `save` を済ませるか、`discard` してから抜けてください。
 - configuration モードの `show configuration` / `show interfaces` は
   candidate を表示します。`show running-config` は現在の running を表示します。
   `show routes` / `neighbors` / `bridge` / `statistics` などの運用表示は
   running のデータプレーンを参照します。
 - candidate は制御セッション（Unix ソケット接続）ごとにコアが保持します。
   切断すると未保存の candidate は破棄されます。
-- コア起動時に `--no-persist` を指定した場合、`save` は running の更新だけを
-  行い、設定ファイルは書きません。
-- 別セッションが先に `save` した場合、古い candidate の `save` は競合として
-  拒否されます。`discard` してから編集し直してください。
+- コア起動時に `--no-persist` を指定した場合、`commit` は running に反映しますが
+  `save` は利用できません。
+- 別セッションが先に `commit` した場合、古い candidate の `commit` は競合として
+  拒否されます。`discard` してから編集し直してください。`save` は現在の
+  running を保存するため、別セッションの commit 結果を保存できます。
 
 ### 5.2 ワンショット / バッチ
 
@@ -230,7 +234,7 @@ Backspace / Delete で編集できます。Ctrl-L で画面クリア、Ctrl-C �
 ```
 
 `set` / `delete` / `del` をワンショットで渡した場合は、互換性のため
-「configure → 編集 → save → exit」を 1 トランザクションとして実行します。
+「configure → 編集 → commit → save → exit」を 1 トランザクションとして実行します。
 
 ```sh
 ./scripts/routerctl set interfaces ethernet eth0 address 192.0.2.1/24
@@ -375,10 +379,11 @@ help
 ```
 
 configuration モードの `set` / `delete` は candidate だけを更新します。
-`save` / `commit` 時に、candidate の検証、FIB 構築、データプレーンへの
-一括反映、設定ファイルの原子的更新（一時ファイル + `rename()`）を行います。
-save の途中で失敗した場合は running を旧設定へ戻し、candidate は保持します。
-ワンショットの `set` / `delete` と `--file` は、この save までを自動で
+`commit` 時に candidate の検証、FIB 構築、データプレーンへの一括反映を
+行います。`save` 時に running を設定ファイルへ原子的に更新します
+（一時ファイル + `rename()`）。commit 失敗時は running を変更しません。
+save 失敗時は running を維持したままエラーを返します。
+ワンショットの `set` / `delete` と `--file` は、commit と save までを自動で
 1 トランザクションとして実行します。
 
 ### 5.5 コンテキストヘルプ
@@ -550,8 +555,8 @@ make test
 - `test_capture`: pcap ヘッダ、count 自動停止、ARP フィルタ、pcap レコード。
 - Rust: EtherIP4/6 ラウンドトリップ、C ABI のレイアウトと FFI 呼び出し。
 - `scripts/smoke-test.sh`: `net_null` で実プロセスを起動し、`routerctl` の
-  read / configuration モード、candidate の save / discard、未保存 exit の
-  拒否、`--file` トランザクション、pcap キャプチャ、永続化、再起動、
+  read / configuration モード、candidate の commit / save / discard、
+  未 commit / 未 save exit の拒否、`--file` トランザクション、pcap キャプチャ、永続化、再起動、
   ホット追加、Rust プラグインのロードを確認。
 
 ### VM で全テストを実行

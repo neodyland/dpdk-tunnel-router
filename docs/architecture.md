@@ -52,7 +52,7 @@ struct cli_session {
 ```
 
 - **read モード**: `show` / `help` / `configure` / `exit` のみ。
-  `set` / `delete` / `save` / `discard` はコアが拒否します。
+  `set` / `delete` / `commit` / `save` / `discard` はコアが拒否します。
 - **configuration モード**: `configure` で running のコピーを candidate として
   取得します。`set` / `delete` / `del` は candidate のコピーに対して適用し、
   成功した場合だけ candidate を差し替えます。running は変更しません。
@@ -60,24 +60,34 @@ struct cli_session {
   candidate、read モードでは running を表示します。
   `show running-config` は常に running です。
 - `discard` / `rollback` は running から candidate を作り直します。
-- 未保存 (`dirty`) のまま `exit` / `end` / `quit` すると拒否されます。
+- 未 commit (`dirty`) または commit 後未 save のまま `exit` / `end` / `quit`
+  すると拒否されます。
 
-### 2.3 save / commit
+### 2.3 commit / save
 
-`save` / `commit` は candidate を running に反映します。
+`commit` は candidate を running に反映し、`save` は running をファイルへ
+永続化します。
+
+`commit`:
 
 1. `base_revision` と現在の revision を比較し、別セッションの変更を検出。
 2. candidate のコピーに NIC MAC を適用し、`tr_config_validate()`。
 3. `tr_engine_apply()` が新しい FIB と runtime を構築。
 4. `rt_lock` の write lock 下で writer gate を閉じ、全ワーカーの reader flag
    が下りるのを待って runtime ポインタを差し替え。
-5. `tr_config_save()` が設定ファイルを原子的に更新。
-6. 保存に失敗した場合は旧 runtime を再適用してロールバック。
-7. 成功時に revision を進め、`dirty` を落とす。
+5. 成功時に revision を進め、`dirty` を落とす。設定ファイルは変更しない。
 
-パース失敗・検証失敗・FIB 構築失敗のいずれでも running とファイルは
-変更されません。`routerctl` のワンショット `set` / `delete` と `--file` は
-configure から save までを 1 トランザクションとして実行します。
+`save`:
+
+1. candidate が dirty なら「commit が必要」として拒否。
+2. 現在の running を読み出す。
+3. `tr_config_save()` が設定ファイルを原子的に更新。
+4. 成功時に saved revision を更新。
+
+commit の失敗（検証/FIB/runtime）では running とファイルは変更されません。
+save の失敗では running は維持され、再度 `save` できます。
+`routerctl` のワンショット `set` / `delete` と `--file` は
+configure → commit → save を 1 トランザクションとして実行します。
 
 ### 2.4 永続化
 
