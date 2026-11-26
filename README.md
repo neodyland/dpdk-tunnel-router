@@ -45,6 +45,7 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
 | ブリッジ | MAC 学習、フラッディング、エージング。VLAN 子インタフェースやトンネルをメンバーにできる |
 | 静的ルート | IPv4/IPv6 の最長一致FIB。再帰的な next-hop 解決に対応 |
 | 並列処理 | DPDK RSS + マルチキュー + ワーカー lcore。パケット処理はロックなし、設定は reader gate 付きの不変スナップショット差し替え |
+| Ping | `ping <IPv4/IPv6>` でデータプレーン経由の ICMP echo。FIB / ARP / NDP / VLAN を使用 |
 | デバッグキャプチャ | `tcpdump start/stop/status` で pcap を取得。物理 RX/TX、トンネル内側 RX/TX、簡易フィルタ、count/snaplen 対応 |
 | 永続化 | 正常に適用された設定だけをコアが原子的に保存。クライアントは設定ファイルを書かない |
 
@@ -303,7 +304,44 @@ tcpdump -i <name|any> -w <file> [-d ...] [-s ...] [-c ...] [filter ...]
   pcap を書き込むのはコアプロセスなので、コアの実行ユーザーが書き込めるパスを指定してください。
 - キャプチャ中にリングがあふれた場合は `drops` に計上されます。
 
-### 5.4 設定コマンド
+### 5.4 ping
+
+データプレーン経由で ICMP echo request を送信します。通常の FIB、ARP/NDP、
+VLAN、トンネルのアンダーレイ経路が使われます。
+
+```sh
+./scripts/routerctl ping 192.0.2.1
+./scripts/routerctl ping 2001:db8::1 count 2
+./scripts/routerctl ping 198.51.100.2 count 3 interface eth1
+./scripts/routerctl ping fe80::1 interface eth0
+```
+
+```text
+ping <IPv4|IPv6> [count N] [timeout MS] [size BYTES]
+     [source ADDR] [interface IF]
+
+count      1..64 (default 4)
+timeout    100..10000 ms per reply (default 1000)
+size       8..1400 ICMP payload bytes (default 56)
+source     local source address
+interface  Ethernet/VLAN egress
+```
+
+`interface` は link-local IPv6 や、FIB を使わず特定ポートへ送る場合に指定します。
+ping は running（commit 済み）の FIB / インタフェースを使います。
+
+`show neighbors` は ARP/NDP エントリに加えて、ブリッジの L2 MAC テーブルも
+表示します。
+
+```text
+IPv4 neighbors:
+eth0  192.0.2.2  lladdr aa:bb:cc:dd:ee:ff reachable age 120ms pending 0
+
+MAC table (bridge forwarding):
+bridge br0  mac aa:bb:cc:dd:ee:ff  port eth0  age 120ms
+```
+
+### 5.5 設定コマンド
 
 ```text
 set interfaces tunnel <Tunnel name> remote <IPv4 / IPv6>
@@ -386,7 +424,7 @@ save 失敗時は running を維持したままエラーを返します。
 ワンショットの `set` / `delete` と `--file` は、commit と save までを自動で
 1 トランザクションとして実行します。
 
-### 5.5 コンテキストヘルプ
+### 5.6 コンテキストヘルプ
 
 `?` をコマンドの末尾に付けると、その位置で使える構文・現在値・例を表示します。
 
@@ -400,6 +438,7 @@ router> set interfaces tunnel tun0 ?
 router> set protocols static route ?
 router> show ?
 router> tcpdump ?
+router> ping ?
 ```
 
 `help <path>` でも同じ内容を表示できます。
@@ -550,14 +589,15 @@ make test
 - `test_fib`: connected / static / 再帰 next-hop / IPv6 LPM。
 - `test_reasm`: IPv4/IPv6 フラグメントの逆順再組み立て、重なり拒否。
 - `test_engine`: ARP、NDP、IPv4 転送、VLAN、ブリッジ、RA/SLAAC、
-  9000 byte オーバーレイを 1500 byte アンダーレイへ分割して再組み立て、
-  TCP MSS clamping とチェックサム。
+  データプレーン ping、MAC テーブル表示、9000 byte オーバーレイを 1500 byte
+  アンダーレイへ分割して再組み立て、TCP MSS clamping とチェックサム。
 - `test_capture`: pcap ヘッダ、count 自動停止、ARP フィルタ、pcap レコード。
 - Rust: EtherIP4/6 ラウンドトリップ、C ABI のレイアウトと FFI 呼び出し。
 - `scripts/smoke-test.sh`: `net_null` で実プロセスを起動し、`routerctl` の
   read / configuration モード、candidate の commit / save / discard、
-  未 commit / 未 save exit の拒否、`--file` トランザクション、pcap キャプチャ、永続化、再起動、
-  ホット追加、Rust プラグインのロードを確認。
+  未 commit / 未 save exit の拒否、`--file` トランザクション、pcap キャプチャ、
+  ping、show neighbors の MAC テーブル、永続化、再起動、ホット追加、
+  Rust プラグインのロードを確認。
 
 ### VM で全テストを実行
 

@@ -159,6 +159,12 @@ ctl show interfaces | grep -q '203.0.113.1/24' || {
     exit 1
 }
 
+# Data-plane ping and the enhanced neighbor/MAC table.
+ping_out=$(ctl ping 203.0.113.254 count 1 timeout 100)
+expect_contains "$ping_out" "packets transmitted" "ping statistics"
+neigh_out=$(ctl show neighbors)
+expect_contains "$neigh_out" "MAC table (bridge forwarding)" "MAC table"
+
 # commit reflects the running data plane but must not write the config file.
 if printf 'configure\nset interfaces ethernet eth0 address 203.0.113.5/24\ncommit\n' |
     "$CLI" --socket "$SOCK" --quiet >/dev/null 2>&1; then

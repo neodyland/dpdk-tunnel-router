@@ -3,6 +3,8 @@
 
 #include "addr.h"
 
+struct tr_config;
+
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -59,6 +61,7 @@ int tr_neigh_request_allowed(struct tr_neigh_table *t, int if_slot,
 void tr_neigh_expire(struct tr_neigh_table *t, uint64_t now);
 void tr_neigh_clear_iface(struct tr_neigh_table *t, int if_slot);
 void tr_neigh_clear(struct tr_neigh_table *t);
-int tr_neigh_show(struct tr_neigh_table *t, char **out);
+int tr_neigh_show(struct tr_neigh_table *t, const struct tr_config *cfg,
+                  uint64_t now, char **out);
 
 #endif

@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define ETH_HLEN 14
 #define ETH_TYPE_IPV4 0x0800
@@ -51,6 +52,20 @@
 #define TR_RT_CACHE_SIZE 1024
 #define TR_NEIGH_CACHE_SIZE 512
 #define TR_NEIGH_CACHE_TTL_MS 2000
+#define TR_PING_MAX 64
+
+struct tr_ping_state {
+    pthread_mutex_t lock;
+    _Atomic bool active;
+    uint16_t id;
+    uint16_t seq;
+    bool replied;
+    uint8_t ttl;
+    uint64_t sent_ns;
+    uint64_t rtt_ns;
+    struct tr_ip target;
+    struct tr_ip source;
+};
 
 struct tr_rt_cache_entry {
     uint64_t generation;
@@ -167,6 +182,8 @@ struct tr_engine {
     int ra_tail;
 
     bool rs_sent;
+    uint16_t ping_id;
+    struct tr_ping_state ping;
 };
 
 static void free_mbuf_cb(void *pkt)
@@ -467,6 +484,7 @@ struct tr_engine *tr_engine_create(const struct tr_engine_params *params,
     e->mp = params->mp;
     pthread_rwlock_init(&e->rt_lock, NULL);
     pthread_mutex_init(&e->ra_lock, NULL);
+    pthread_mutex_init(&e->ping.lock, NULL);
     tr_neigh_init(&e->neigh4, free_mbuf_cb);
     tr_neigh_init(&e->neigh6, free_mbuf_cb);
     tr_bridge_db_init(&e->bridges);
@@ -500,6 +518,7 @@ void tr_engine_destroy(struct tr_engine *e)
     tr_bridge_db_fini(&e->bridges);
     for (int i = 0; i < TR_MAX_WORKERS; i++)
         tr_reasm_fini(&e->reasm[i]);
+    pthread_mutex_destroy(&e->ping.lock);
     pthread_mutex_destroy(&e->ra_lock);
     pthread_rwlock_destroy(&e->rt_lock);
     free(e);
@@ -1824,6 +1843,10 @@ static void handle_ra(struct tr_engine *e, int worker, struct tr_runtime *rt,
     }
 }
 
+static void ping_note_reply(struct tr_engine *e, const struct tr_ip *src,
+                            const struct tr_ip *dst, const uint8_t *icmp,
+                            uint8_t ttl);
+
 static void handle_icmp6(struct tr_engine *e, int worker,
                          struct tr_runtime *rt, int if_slot,
                          struct rte_mbuf *m, uint32_t l3off,
@@ -1892,6 +1915,11 @@ static void handle_icmp6(struct tr_engine *e, int worker,
         rte_pktmbuf_free(m);
         return;
     }
+    if (icmp_type == ICMPV6_ECHO_REPLY) {
+        ping_note_reply(e, &src, &dst, icmp, ip[7]);
+        rte_pktmbuf_free(m);
+        return;
+    }
     if (icmp_type == ICMPV6_ECHO_REQUEST && is_local_if(rt, if_slot, &dst)) {
         send_echo_reply6(e, worker, rt, if_slot, m, l3off);
         rte_pktmbuf_free(m);
@@ -1902,6 +1930,27 @@ drop:
     rte_pktmbuf_free(m);
 }
 
+static void ping_note_reply(struct tr_engine *e, const struct tr_ip *src,
+                            const struct tr_ip *dst, const uint8_t *icmp,
+                            uint8_t ttl)
+{
+    if (!atomic_load_explicit(&e->ping.active, memory_order_relaxed))
+        return;
+    uint16_t id = (uint16_t)(icmp[4] << 8 | icmp[5]);
+    uint16_t seq = (uint16_t)(icmp[6] << 8 | icmp[7]);
+    uint64_t now = tr_monotonic_ns();
+
+    pthread_mutex_lock(&e->ping.lock);
+    if (e->ping.active && id == e->ping.id && seq == e->ping.seq &&
+        !e->ping.replied && tr_ip_equal(src, &e->ping.target) &&
+        tr_ip_equal(dst, &e->ping.source)) {
+        e->ping.replied = true;
+        e->ping.ttl = ttl;
+        e->ping.rtt_ns = now - e->ping.sent_ns;
+    }
+    pthread_mutex_unlock(&e->ping.lock);
+}
+
 static void handle_icmp4(struct tr_engine *e, int worker,
                          struct tr_runtime *rt, int if_slot,
                          struct rte_mbuf *m, uint32_t l3off,
@@ -1910,6 +1959,15 @@ static void handle_icmp4(struct tr_engine *e, int worker,
     uint8_t *icmp = mtod(m) + l3off + 20;
     if (mlen(m) < l3off + 20 + 8)
         goto drop;
+    if (icmp[0] == ICMP_ECHO_REPLY) {
+        struct tr_ip src = {.family = TR_AF_INET};
+        struct tr_ip dst = {.family = TR_AF_INET};
+        memcpy(&src.u.v4, ip + 12, 4);
+        memcpy(&dst.u.v4, ip + 16, 4);
+        ping_note_reply(e, &src, &dst, icmp, ip[8]);
+        rte_pktmbuf_free(m);
+        return;
+    }
     if (icmp[0] != ICMP_ECHO)
         goto drop;
     send_echo_reply4(e, worker, rt, if_slot, m, l3off);
@@ -2602,6 +2660,259 @@ void tr_engine_send_router_solicitations(struct tr_engine *e)
     e->rs_sent = true;
 }
 
+static int ping_send_packet(struct tr_engine *e, struct tr_runtime *rt,
+                            int if_slot, const struct tr_ip *next_hop,
+                            const struct tr_ip *source,
+                            const struct tr_ip *target, uint16_t id,
+                            uint16_t seq, size_t payload_len)
+{
+    const struct tr_iface *iface = rt_iface(rt, if_slot);
+    bool v4 = target->family == TR_AF_INET;
+    uint32_t l3len = (v4 ? 20u : 40u);
+    uint32_t total = 14 + l3len + 8 + (uint32_t)payload_len;
+    struct rte_mbuf *m;
+    uint8_t *p, *icmp;
+
+    if (!iface)
+        return -1;
+    m = pkt_alloc(e, total);
+    if (!m)
+        return -1;
+    p = mtod(m);
+    memset(p, 0, 6);
+    memcpy(p + 6, iface->mac, 6);
+    if (v4) {
+        p[12] = ETH_TYPE_IPV4 >> 8;
+        p[13] = ETH_TYPE_IPV4 & 0xff;
+        build_ip4(p + 14, 20 + 8 + (uint32_t)payload_len, IPPROTO_ICMP,
+                  (const uint8_t *)&source->u.v4,
+                  (const uint8_t *)&target->u.v4, 64, id);
+        icmp = p + 34;
+        icmp[0] = ICMP_ECHO;
+    } else {
+        p[12] = ETH_TYPE_IPV6 >> 8;
+        p[13] = ETH_TYPE_IPV6 & 0xff;
+        build_ip6(p + 14, (uint16_t)(8 + payload_len), IPPROTO_ICMPV6,
+                  (const uint8_t *)&source->u.v6,
+                  (const uint8_t *)&target->u.v6, 64);
+        icmp = p + 54;
+        icmp[0] = ICMPV6_ECHO_REQUEST;
+    }
+    icmp[1] = 0;
+    icmp[2] = 0;
+    icmp[3] = 0;
+    icmp[4] = (uint8_t)(id >> 8);
+    icmp[5] = (uint8_t)id;
+    icmp[6] = (uint8_t)(seq >> 8);
+    icmp[7] = (uint8_t)seq;
+    for (size_t i = 0; i < payload_len; i++)
+        icmp[8 + i] = (uint8_t)(0x40 + (i & 0x3f));
+    uint16_t csum;
+    if (v4) {
+        csum = tr_checksum16(icmp, 8 + (uint32_t)payload_len, 0);
+    } else {
+        uint32_t sum = checksum_add_pseudo6(0, (const uint8_t *)&source->u.v6,
+                                            (const uint8_t *)&target->u.v6,
+                                            IPPROTO_ICMPV6,
+                                            8 + (uint32_t)payload_len);
+        sum = tr_checksum_add(sum, icmp, 8 + payload_len);
+        csum = tr_checksum16_finish(sum);
+    }
+    icmp[2] = (uint8_t)(csum >> 8);
+    icmp[3] = (uint8_t)csum;
+
+    uint8_t mac[6];
+    uint8_t state = 0;
+    struct tr_neigh_table *t =
+        next_hop->family == TR_AF_INET ? &e->neigh4 : &e->neigh6;
+    uint64_t now = tr_monotonic_ms();
+    if (tr_neigh_get(t, if_slot, next_hop, mac, now, &state)) {
+        memcpy(p, mac, 6);
+        egress_frame(e, 0, rt, if_slot, m);
+        return 0;
+    }
+    if (tr_neigh_queue(t, if_slot, next_hop, m, now)) {
+        rte_pktmbuf_free(m);
+        return -1;
+    }
+    if (tr_neigh_request_allowed(t, if_slot, next_hop, now, 1000))
+        send_neighbor_request(e, 0, rt, if_slot, next_hop, next_hop->family);
+    return 0;
+}
+
+int tr_engine_ping(struct tr_engine *e, const struct tr_ip *target,
+                   const char *interface, const struct tr_ip *source,
+                   int count, int timeout_ms, size_t payload_len, char **out)
+{
+    char *buf = NULL;
+    size_t blen = 0;
+    FILE *f;
+    struct tr_ip tgt;
+    struct tr_ip src = {0};
+    int received = 0;
+    int sent = 0;
+    uint16_t id;
+    char tbuf[96];
+
+    if (!e || !target || !out || count < 1 || count > TR_PING_MAX ||
+        payload_len < 8 || payload_len > 1400 || timeout_ms < 100)
+        return -1;
+    *out = NULL;
+    tr_ip_ntop(target, tbuf, sizeof(tbuf));
+    pthread_mutex_lock(&e->ping.lock);
+    if (e->ping.active) {
+        pthread_mutex_unlock(&e->ping.lock);
+        if (asprintf(out, "ping: another ping is already running\n") < 0)
+            *out = NULL;
+        return -1;
+    }
+    id = ++e->ping_id;
+    if (id == 0)
+        id = ++e->ping_id;
+    tgt = *target;
+    e->ping.id = id;
+    e->ping.target = tgt;
+    e->ping.source = src;
+    e->ping.replied = false;
+    e->ping.seq = 0;
+    atomic_store_explicit(&e->ping.active, true, memory_order_release);
+    pthread_mutex_unlock(&e->ping.lock);
+
+    f = open_memstream(&buf, &blen);
+    if (!f) {
+        atomic_store_explicit(&e->ping.active, false, memory_order_release);
+        return -1;
+    }
+    fprintf(f, "PING %s: %zu data bytes\n", tbuf, payload_len);
+
+    for (int i = 0; i < count; i++) {
+        struct tr_runtime *rt;
+        struct tr_iface *iface = NULL;
+        struct tr_ip next_hop = tgt;
+        struct tr_ip chosen = {0};
+        struct tr_fib_result res;
+        int egress = -1;
+        bool route_ok = false;
+        uint64_t send_ms;
+
+        pthread_rwlock_rdlock(&e->rt_lock);
+        rt = e->rt;
+        if (interface && interface[0]) {
+            iface = tr_config_find(&rt->cfg, interface);
+            if (!iface || (iface->kind != TR_IF_ETHERNET &&
+                           iface->kind != TR_IF_VLAN)) {
+                fprintf(f, "ping: unknown/non-L3 interface '%s'\n", interface);
+                pthread_rwlock_unlock(&e->rt_lock);
+                break;
+            }
+            egress = iface->slot;
+        }
+        if (tr_ip_is_linklocal(&tgt) && egress >= 0) {
+            route_ok = true;
+        } else if (!tr_fib_lookup(&rt->fib, &tgt, &res) &&
+                   res.route->if_slot >= 0) {
+            if (egress < 0)
+                egress = res.route->if_slot;
+            if (egress != res.route->if_slot) {
+                fprintf(f, "ping: target is not routed via %s\n", interface);
+                pthread_rwlock_unlock(&e->rt_lock);
+                break;
+            }
+            if (res.route->connected)
+                next_hop = tgt;
+            else if (res.route->has_via)
+                next_hop = res.route->via;
+            route_ok = true;
+        } else if (egress >= 0) {
+            /* Point-to-point / link-local use of an explicit interface. */
+            route_ok = true;
+        }
+        if (!route_ok || egress < 0) {
+            fprintf(f, "ping: no route to %s\n", tbuf);
+            pthread_rwlock_unlock(&e->rt_lock);
+            break;
+        }
+        iface = rt_iface(rt, egress);
+        if (!iface || iface->kind == TR_IF_TUNNEL) {
+            fprintf(f, "ping: unsupported egress interface\n");
+            pthread_rwlock_unlock(&e->rt_lock);
+            break;
+        }
+        if (source && source->family) {
+            if (source->family != tgt.family ||
+                !is_local_if(rt, egress, source)) {
+                fprintf(f, "ping: source address is not local to the "
+                           "egress interface\n");
+                pthread_rwlock_unlock(&e->rt_lock);
+                break;
+            }
+            chosen = *source;
+        } else if (pick_addr(rt, egress, tgt.family,
+                             tr_ip_is_linklocal(&tgt), &chosen)) {
+            fprintf(f, "ping: no source address on %s\n", iface->name);
+            pthread_rwlock_unlock(&e->rt_lock);
+            break;
+        }
+
+        pthread_mutex_lock(&e->ping.lock);
+        e->ping.seq = (uint16_t)i;
+        e->ping.replied = false;
+        e->ping.source = chosen;
+        e->ping.sent_ns = tr_monotonic_ns();
+        send_ms = tr_monotonic_ms();
+        pthread_mutex_unlock(&e->ping.lock);
+
+        int rc = ping_send_packet(e, rt, egress, &next_hop, &chosen, &tgt,
+                                  id, (uint16_t)i, payload_len);
+        pthread_rwlock_unlock(&e->rt_lock);
+        if (rc) {
+            fprintf(f, "ping: send failed\n");
+            break;
+        }
+        sent++;
+
+        bool replied = false;
+        uint64_t rtt_ns = 0;
+        uint8_t ttl = 0;
+        uint64_t deadline = send_ms + (uint64_t)timeout_ms;
+        for (;;) {
+            pthread_mutex_lock(&e->ping.lock);
+            replied = e->ping.replied;
+            rtt_ns = e->ping.rtt_ns;
+            ttl = e->ping.ttl;
+            pthread_mutex_unlock(&e->ping.lock);
+            if (replied || tr_monotonic_ms() >= deadline)
+                break;
+            usleep(10000);
+        }
+        if (replied) {
+            char abuf[96];
+            tr_ip_ntop(&tgt, abuf, sizeof(abuf));
+            fprintf(f, "%zu bytes from %s: icmp_seq=%d ttl=%u time=%.3f ms\n",
+                    payload_len + 8, abuf, i, ttl,
+                    (double)rtt_ns / 1e6);
+            received++;
+        } else {
+            fprintf(f, "Request timeout for icmp_seq=%d\n", i);
+        }
+        if (i + 1 < count) {
+            uint64_t elapsed = tr_monotonic_ms() - send_ms;
+            if (elapsed < 1000)
+                usleep((useconds_t)((1000 - elapsed) * 1000));
+        }
+    }
+
+    fprintf(f, "--- %s ping statistics ---\n", tbuf);
+    fprintf(f, "%d packets transmitted, %d received, %d%% packet loss\n",
+            sent, received, sent ? (sent - received) * 100 / sent : 100);
+    fclose(f);
+    pthread_mutex_lock(&e->ping.lock);
+    atomic_store_explicit(&e->ping.active, false, memory_order_release);
+    pthread_mutex_unlock(&e->ping.lock);
+    *out = buf;
+    return 0;
+}
+
 int tr_engine_stats_text(struct tr_engine *e, char **out)
 {
     char *buf = NULL;
@@ -2681,30 +2992,46 @@ int tr_engine_show(struct tr_engine *e, int argc, char **argv, char **out)
         return 0;
     }
     if (strcmp(argv[0], "neighbors") == 0) {
-        char *n4 = NULL, *n6 = NULL, *buf = NULL;
+        char *n4 = NULL, *n6 = NULL, *mac = NULL, *buf = NULL;
         size_t n = 0;
         FILE *f;
-        if (tr_neigh_show(&e->neigh4, &n4) ||
-            tr_neigh_show(&e->neigh6, &n6)) {
+        uint64_t now = tr_monotonic_ms();
+        pthread_rwlock_rdlock(&e->rt_lock);
+        if (tr_neigh_show(&e->neigh4, &e->rt->cfg, now, &n4) ||
+            tr_neigh_show(&e->neigh6, &e->rt->cfg, now, &n6) ||
+            tr_bridge_show(&e->bridges, &e->rt->cfg, now, &mac)) {
+            pthread_rwlock_unlock(&e->rt_lock);
             free(n4);
             free(n6);
+            free(mac);
             return -1;
         }
         f = open_memstream(&buf, &n);
         if (!f) {
+            pthread_rwlock_unlock(&e->rt_lock);
             free(n4);
             free(n6);
+            free(mac);
             return -1;
         }
-        fprintf(f, "IPv4 neighbors:\n%sIPv6 neighbors:\n%s", n4, n6);
+        fprintf(f, "IPv4 neighbors:\n%s\nIPv6 neighbors:\n%s\n"
+                   "MAC table (bridge forwarding):\n%s%s",
+                n4, n6, mac && mac[0] ? mac : "", mac && mac[0] ? "" : "(empty)\n");
         free(n4);
         free(n6);
+        free(mac);
         fclose(f);
+        pthread_rwlock_unlock(&e->rt_lock);
         *out = buf;
         return 0;
     }
-    if (strcmp(argv[0], "bridge") == 0)
-        return tr_bridge_show(&e->bridges, out);
+    if (strcmp(argv[0], "bridge") == 0) {
+        int rc;
+        pthread_rwlock_rdlock(&e->rt_lock);
+        rc = tr_bridge_show(&e->bridges, &e->rt->cfg, tr_monotonic_ms(), out);
+        pthread_rwlock_unlock(&e->rt_lock);
+        return rc;
+    }
     if (strcmp(argv[0], "tunnels") == 0) {
         char *buf = NULL;
         size_t n = 0;

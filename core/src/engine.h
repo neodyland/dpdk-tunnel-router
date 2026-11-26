@@ -41,6 +41,13 @@ void tr_engine_destroy(struct tr_engine *e);
 void tr_engine_set_tx(struct tr_engine *e, tr_tx_fn tx, void *arg);
 void tr_engine_set_tx_ipv4_cksum(struct tr_engine *e, bool enabled);
 
+/* Send ICMP echo requests through the data plane and wait for replies.
+ * `interface` and `source` may be NULL. `out` is malloc'ed. */
+int tr_engine_ping(struct tr_engine *e, const struct tr_ip *target,
+                   const char *interface, const struct tr_ip *source,
+                   int count, int timeout_ms, size_t payload_len,
+                   char **out);
+
 int tr_engine_apply(struct tr_engine *e, const struct tr_config *cfg,
                     char *err, size_t errlen);
 void tr_engine_config_env(struct tr_engine *e, struct tr_config_env *env);

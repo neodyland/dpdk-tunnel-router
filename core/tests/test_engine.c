@@ -9,7 +9,9 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 
+#include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #define CAP_MAX 512
 
@@ -859,6 +861,11 @@ static int test_bridge(struct rte_mempool *mp, struct capture *cap)
     capture_reset(cap);
     CHECK(tr_engine_input(e, 0, eth0, m) == 0);
     CHECK(cap->n == 1 && cap->slot[0] == eth1);
+    char *macs = NULL;
+    CHECK(tr_engine_show(e, 1, (char *[]){"bridge"}, &macs) == 0);
+    CHECK(strstr(macs, "br0") != NULL);
+    CHECK(strstr(macs, "eth1") != NULL);
+    free(macs);
     capture_reset(cap);
     tr_engine_destroy(e);
     return 0;
@@ -1146,6 +1153,113 @@ static int test_etherip4(struct rte_mempool *mp, struct capture *cap)
 }
 
 
+struct ping_reply_arg {
+    struct tr_engine *e;
+    struct rte_mempool *mp;
+};
+
+static void *ping_reply_thread(void *arg)
+{
+    struct ping_reply_arg *a = arg;
+    usleep(50000);
+    struct rte_mbuf *m = rte_pktmbuf_alloc(a->mp);
+    if (!m || !rte_pktmbuf_append(m, 14 + 20 + 8 + 56))
+        return NULL;
+    uint8_t *p = rte_pktmbuf_mtod(m, uint8_t *);
+    memset(p, 0, 14 + 20 + 8 + 56);
+    const uint8_t dm[6] = {0x02, 0, 0, 0, 0, 2};
+    const uint8_t sm[6] = {0x02, 0, 0, 0, 0, 0xbb};
+    memcpy(p, dm, 6);
+    memcpy(p + 6, sm, 6);
+    p[12] = 0x08;
+    p[13] = 0;
+    uint8_t *ip = p + 14;
+    ip[0] = 0x45;
+    ip[2] = 0;
+    ip[3] = 84;
+    ip[8] = 64;
+    ip[9] = 1;
+    inet_pton(AF_INET, "198.51.100.2", ip + 12);
+    inet_pton(AF_INET, "198.51.100.1", ip + 16);
+    uint32_t sum = 0;
+    for (int i = 0; i < 20; i += 2)
+        sum += (uint32_t)(ip[i] << 8) | ip[i + 1];
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    sum = ~sum;
+    ip[10] = (uint8_t)(sum >> 8);
+    ip[11] = (uint8_t)sum;
+    uint8_t *icmp = ip + 20;
+    icmp[0] = 0;
+    icmp[5] = 1;
+    for (int i = 0; i < 56; i++)
+        icmp[8 + i] = (uint8_t)(0x40 + (i & 0x3f));
+    sum = 0;
+    for (int i = 0; i < 64; i += 2)
+        sum += (uint32_t)(icmp[i] << 8) | icmp[i + 1];
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    sum = ~sum;
+    icmp[2] = (uint8_t)(sum >> 8);
+    icmp[3] = (uint8_t)sum;
+    tr_engine_input(a->e, 0, 1, m);
+    return NULL;
+}
+
+static int test_ping(struct rte_mempool *mp, struct capture *cap)
+{
+    struct tr_config cfg, env_cfg;
+    struct tr_config_env env;
+    struct tr_engine *e;
+    char err[256];
+    const uint8_t eth0_mac[6] = {0x02, 0, 0, 0, 0, 1};
+    const uint8_t eth1_mac[6] = {0x02, 0, 0, 0, 0, 2};
+    const uint8_t peer_mac[6] = {0x02, 0, 0, 0, 0, 0xbb};
+
+    setup_config(&cfg, &env);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth0 port 0") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0 address 192.0.2.1/24") == 0);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth1 port 1") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth1 address 198.51.100.1/24") == 0);
+    CHECK(set_mac(&cfg, "eth0", eth0_mac) == 0);
+    CHECK(set_mac(&cfg, "eth1", eth1_mac) == 0);
+    e = tr_engine_create(&(struct tr_engine_params){.n_ports = 2,
+                                                    .workers = 1,
+                                                    .mp = mp},
+                         err, sizeof(err));
+    CHECK(e != NULL);
+    tr_engine_set_tx(e, capture_tx, cap);
+    CHECK(tr_engine_apply(e, &cfg, err, sizeof(err)) == 0);
+    tr_engine_config_copy(e, &env_cfg);
+    int eth1 = tr_config_find_const(&env_cfg, "eth1")->slot;
+
+    struct in_addr spa, tpa;
+    inet_pton(AF_INET, "198.51.100.2", &spa);
+    inet_pton(AF_INET, "198.51.100.1", &tpa);
+    struct rte_mbuf *arp =
+        build_arp(mp, eth1_mac, peer_mac, 2, peer_mac, &spa, eth1_mac, &tpa);
+    CHECK(arp != NULL);
+    CHECK(tr_engine_input(e, 0, eth1, arp) == 0);
+    capture_reset(cap);
+
+    struct tr_ip target;
+    CHECK(tr_ip_parse("198.51.100.2", &target) == 0);
+    struct ping_reply_arg pa = {e, mp};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, ping_reply_thread, &pa) == 0);
+    char *out = NULL;
+    CHECK(tr_engine_ping(e, &target, NULL, NULL, 1, 500, 56, &out) == 0);
+    pthread_join(th, NULL);
+    CHECK(out != NULL);
+    CHECK(strstr(out, "1 received") != NULL);
+    free(out);
+    capture_reset(cap);
+    tr_engine_destroy(e);
+    return 0;
+}
+
 static int test_malformed(struct rte_mempool *mp, struct capture *cap)
 {
     struct tr_config cfg, env_cfg;
@@ -1237,6 +1351,7 @@ int main(void)
     rc |= test_vlan_autoconf(mp, &cap);
     rc |= test_bridge(mp, &cap);
     rc |= test_autoconf(mp, &cap);
+    rc |= test_ping(mp, &cap);
     rc |= test_etherip4(mp, &cap);
     rc |= test_malformed(mp, &cap);
     capture_reset(&cap);

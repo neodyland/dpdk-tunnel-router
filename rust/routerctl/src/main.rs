@@ -68,6 +68,8 @@ fn usage(prog: &str) {
          \n\
          Examples:\n\
          \x20 {prog} show status\n\
+         \x20 {prog} show neighbors\n\
+         \x20 {prog} ping 192.0.2.1 count 2\n\
          \x20 {prog} set interfaces ethernet eth0 address 192.0.2.1/24\n\
          \x20 {prog} --file router.conf\n"
     );

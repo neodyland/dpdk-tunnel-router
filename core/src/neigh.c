@@ -1,5 +1,7 @@
 #include "neigh.h"
 
+#include "config.h"
+
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -235,7 +237,8 @@ static const char *state_name(uint8_t state)
     }
 }
 
-int tr_neigh_show(struct tr_neigh_table *t, char **out)
+int tr_neigh_show(struct tr_neigh_table *t, const struct tr_config *cfg,
+                  uint64_t now, char **out)
 {
     size_t cap = 4096, len = 0;
     char *buf = malloc(cap);
@@ -248,15 +251,25 @@ int tr_neigh_show(struct tr_neigh_table *t, char **out)
         pthread_spin_lock(&b->lock);
         for (int j = 0; j < TR_NEIGH_PER_BUCKET; j++) {
             struct tr_neigh_entry *e = &b->entries[j];
-            char ip[INET6_ADDRSTRLEN], mac[18];
+            char ip[INET6_ADDRSTRLEN], mac[18], ifname[TR_IFNAME_LEN];
             if (!e->used)
                 continue;
+            snprintf(ifname, sizeof(ifname), "if%d", e->if_slot);
+            if (cfg && e->if_slot >= 0 && e->if_slot < TR_MAX_IFACES &&
+                cfg->ifaces[e->if_slot].present)
+                snprintf(ifname, sizeof(ifname), "%s",
+                         cfg->ifaces[e->if_slot].name);
             tr_ip_ntop(&e->ip, ip, sizeof(ip));
             tr_format_mac(e->mac, mac);
-            char line[160];
+            uint64_t age = 0;
+            if (e->last_seen && now >= e->last_seen)
+                age = now - e->last_seen;
+            char line[192];
             int n = snprintf(line, sizeof(line),
-                             "if%d %s lladdr %s %s pending %d\n", e->if_slot,
-                             ip, mac, state_name(e->state), e->npending);
+                             "%-12s %-40s lladdr %s %-10s age %llums "
+                             "pending %d\n",
+                             ifname, ip, mac, state_name(e->state),
+                             (unsigned long long)age, e->npending);
             if (n < 0)
                 continue;
             if (len + (size_t)n + 1 > cap) {

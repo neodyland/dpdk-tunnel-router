@@ -30,6 +30,13 @@ uint64_t tr_monotonic_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+uint64_t tr_monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 uint32_t tr_checksum_add(uint32_t sum, const void *data, size_t len)
 {
     const uint8_t *p = data;

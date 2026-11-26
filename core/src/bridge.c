@@ -1,5 +1,6 @@
 #include "bridge.h"
 
+#include "config.h"
 #include "util.h"
 
 #include <stdio.h>
@@ -142,7 +143,8 @@ void tr_bridge_clear_iface(struct tr_bridge_db *db, int if_slot)
     }
 }
 
-int tr_bridge_show(struct tr_bridge_db *db, char **out)
+int tr_bridge_show(struct tr_bridge_db *db, const struct tr_config *cfg,
+                   uint64_t now, char **out)
 {
     size_t cap = 4096, len = 0;
     char *buf = malloc(cap);
@@ -157,12 +159,26 @@ int tr_bridge_show(struct tr_bridge_db *db, char **out)
             pthread_spin_lock(&b->lock);
             for (int j = 0; j < TR_BRIDGE_PER_BUCKET; j++) {
                 struct tr_bridge_mac *e = &b->entries[j];
+                char bridge[TR_IFNAME_LEN], port[TR_IFNAME_LEN];
                 if (!e->used)
                     continue;
+                snprintf(bridge, sizeof(bridge), "if%d", t);
+                if (cfg && t < TR_MAX_IFACES && cfg->ifaces[t].present)
+                    snprintf(bridge, sizeof(bridge), "%s", cfg->ifaces[t].name);
+                snprintf(port, sizeof(port), "if%d", e->if_slot);
+                if (cfg && e->if_slot >= 0 && e->if_slot < TR_MAX_IFACES &&
+                    cfg->ifaces[e->if_slot].present)
+                    snprintf(port, sizeof(port), "%s",
+                             cfg->ifaces[e->if_slot].name);
                 tr_format_mac(e->mac, mac);
-                char line[96];
-                int n = snprintf(line, sizeof(line), "bridge if%d %s if%d\n",
-                                 t, mac, e->if_slot);
+                uint64_t age = 0;
+                if (e->last_seen && now >= e->last_seen)
+                    age = now - e->last_seen;
+                char line[160];
+                int n = snprintf(line, sizeof(line),
+                                 "bridge %-12s mac %s port %-12s age %llums\n",
+                                 bridge, mac, port,
+                                 (unsigned long long)age);
                 if (n < 0)
                     continue;
                 if (len + (size_t)n + 1 > cap) {

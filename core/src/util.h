@@ -15,6 +15,7 @@
 uint64_t tr_now_ms(void);
 uint64_t tr_now_sec(void);
 uint64_t tr_monotonic_ms(void);
+uint64_t tr_monotonic_ns(void);
 
 uint16_t tr_checksum16(const void *data, size_t len, uint32_t seed);
 uint16_t tr_checksum16_finish(uint32_t sum);

@@ -39,6 +39,7 @@ int tr_bridge_lookup(struct tr_bridge_db *db, int bridge_slot,
 void tr_bridge_expire(struct tr_bridge_db *db, uint64_t now);
 void tr_bridge_clear(struct tr_bridge_db *db, int bridge_slot);
 void tr_bridge_clear_iface(struct tr_bridge_db *db, int if_slot);
-int tr_bridge_show(struct tr_bridge_db *db, char **out);
+int tr_bridge_show(struct tr_bridge_db *db, const struct tr_config *cfg,
+                   uint64_t now, char **out);
 
 #endif
