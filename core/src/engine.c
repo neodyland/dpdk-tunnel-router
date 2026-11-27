@@ -156,7 +156,8 @@ struct tr_ra_event {
 
 struct tr_vlan_map_entry {
     int parent;
-    uint16_t vid;
+    uint16_t outer;
+    uint16_t inner;
     int16_t child;
     bool used;
 };
@@ -286,12 +287,30 @@ static int pkt_single(const struct rte_mbuf *m)
     return rte_pktmbuf_is_contiguous(m) && m->nb_segs == 1;
 }
 
-static void stats_drop(struct tr_engine *e, int worker, int if_slot)
+static const char *const drop_reason_names[TR_DROP_COUNT] = {
+    "rx-short",  "rx-mac",  "rx-type", "rx-cksum", "rx-malformed",
+    "no-route",  "mtu",     "df",      "ttl",      "neigh",
+    "frag",      "tunnel",  "no-tunnel", "bridge", "other",
+};
+
+const char *tr_drop_reason_name(int reason)
 {
-    if (if_slot >= 0 && if_slot < TR_MAX_IFACES && worker >= 0 &&
-        worker < TR_MAX_WORKERS)
-        atomic_fetch_add_explicit(&e->stats[if_slot][worker].drops, 1,
-                                  memory_order_relaxed);
+    if (reason < 0 || reason >= TR_DROP_COUNT)
+        return "?";
+    return drop_reason_names[reason];
+}
+
+static void stats_drop_reason(struct tr_engine *e, int worker, int if_slot,
+                              enum tr_drop_reason why)
+{
+    if (if_slot < 0 || if_slot >= TR_MAX_IFACES || worker < 0 ||
+        worker >= TR_MAX_WORKERS)
+        return;
+    atomic_fetch_add_explicit(&e->stats[if_slot][worker].drops, 1,
+                              memory_order_relaxed);
+    if ((unsigned)why < (unsigned)TR_DROP_COUNT)
+        atomic_fetch_add_explicit(&e->stats[if_slot][worker].drop_reason[why],
+                                  1, memory_order_relaxed);
 }
 
 static void stats_rx_bulk(struct tr_engine *e, int worker, int if_slot,
@@ -480,15 +499,21 @@ static int runtime_build(struct tr_engine *e, const struct tr_config *cfg,
         const struct tr_iface *iface = &rt->cfg.ifaces[i];
         if (!iface->present || iface->kind != TR_IF_VLAN)
             continue;
-        unsigned h = (unsigned)((iface->parent * 4096 + iface->vlan_id) *
-                                2654435761u) & (TR_VLAN_MAP_SIZE - 1);
+        uint16_t outer = iface->vlan_outer >= 0
+                             ? (uint16_t)iface->vlan_outer
+                             : (uint16_t)iface->vlan_id;
+        uint16_t inner = iface->vlan_outer >= 0 ? (uint16_t)iface->vlan_id : 0;
+        unsigned h = (unsigned)(((iface->parent * 4096 + outer) * 2654435761u) ^
+                                inner) &
+                     (TR_VLAN_MAP_SIZE - 1);
         for (int probe = 0; probe < TR_VLAN_MAP_SIZE; probe++) {
             struct tr_vlan_map_entry *entry =
                 &rt->vlan_map[(h + (unsigned)probe) & (TR_VLAN_MAP_SIZE - 1)];
             if (!entry->used) {
                 entry->used = true;
                 entry->parent = iface->parent;
-                entry->vid = (uint16_t)iface->vlan_id;
+                entry->outer = outer;
+                entry->inner = inner;
                 entry->child = (int16_t)i;
                 break;
             }
@@ -800,6 +825,41 @@ static int pkt_strip_vlan(struct rte_mbuf *m, uint16_t *vid)
     return 0;
 }
 
+static int pkt_add_qinq(struct rte_mbuf *m, uint16_t outer, uint16_t inner)
+{
+    uint8_t *p;
+    uint32_t len = mlen(m);
+
+    if (len < 12 || !pkt_single(m))
+        return -1;
+    p = (uint8_t *)rte_pktmbuf_prepend(m, 8);
+    if (!p)
+        return -1;
+    memmove(p, p + 8, 12);
+    p[12] = ETH_TYPE_QINQ >> 8;
+    p[13] = ETH_TYPE_QINQ & 0xff;
+    p[14] = (uint8_t)(outer >> 8);
+    p[15] = (uint8_t)outer;
+    p[16] = ETH_TYPE_VLAN >> 8;
+    p[17] = ETH_TYPE_VLAN & 0xff;
+    p[18] = (uint8_t)(inner >> 8);
+    p[19] = (uint8_t)inner;
+    return 0;
+}
+
+static int pkt_strip_qinq(struct rte_mbuf *m)
+{
+    uint8_t *p = mtod(m);
+    uint32_t len = mlen(m);
+
+    if (len < 22 || p[12] != (ETH_TYPE_QINQ >> 8) || p[13] != 0xa8 ||
+        p[16] != (ETH_TYPE_VLAN >> 8) || p[17] != 0x00 || !pkt_single(m))
+        return -1;
+    memmove(p + 12, p + 20, len - 20);
+    rte_pktmbuf_trim(m, 8);
+    return 0;
+}
+
 static bool pkt_tagged(const struct rte_mbuf *m)
 {
     const uint8_t *p;
@@ -807,7 +867,8 @@ static bool pkt_tagged(const struct rte_mbuf *m)
     if (mlen(m) < 14 || !pkt_single(m))
         return false;
     p = rte_pktmbuf_mtod(m, const uint8_t *);
-    return p[12] == (ETH_TYPE_VLAN >> 8) && p[13] == 0x00;
+    return (p[12] == (ETH_TYPE_VLAN >> 8) && p[13] == 0x00) ||
+           (p[12] == (ETH_TYPE_QINQ >> 8) && p[13] == 0xa8);
 }
 
 
@@ -991,16 +1052,18 @@ static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
         return;
     }
     bool tagged = pkt_tagged(m);
+    bool qinq = iface->kind == TR_IF_VLAN && iface->vlan_outer >= 0;
+    uint32_t tag_len = qinq ? 8 : 4;
     bool will_tag = iface->kind == TR_IF_VLAN && !tagged;
-    uint32_t final_len = mlen(m) + (will_tag ? 4 : 0);
-    maxlen = iface->mtu + ETH_HLEN + ((tagged || will_tag) ? 4 : 0);
+    uint32_t final_len = mlen(m) + (will_tag ? tag_len : 0);
+    maxlen = iface->mtu + ETH_HLEN + ((tagged || will_tag) ? tag_len : 0);
     if (final_len > maxlen) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_MTU);
         rte_pktmbuf_free(m);
         return;
     }
     if (!e->tx) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_OTHER);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1009,8 +1072,11 @@ static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
         /* Logical VLAN tap: untagged inner frame, like tcpdump on eth0.10. */
         if (capture)
             tr_capture_tap_exact(e->capture, if_slot, TR_CAP_TX, m);
-        if (will_tag && pkt_add_vlan(m, (uint16_t)iface->vlan_id)) {
-            stats_drop(e, worker, if_slot);
+        if (will_tag &&
+            (qinq ? pkt_add_qinq(m, (uint16_t)iface->vlan_outer,
+                                 (uint16_t)iface->vlan_id)
+                  : pkt_add_vlan(m, (uint16_t)iface->vlan_id))) {
+            stats_drop_reason(e, worker, if_slot, TR_DROP_MTU);
             rte_pktmbuf_free(m);
             return;
         }
@@ -1440,7 +1506,7 @@ static void resolve_and_send(struct tr_engine *e, int worker,
         return;
     }
     if (tr_neigh_queue(t, if_slot, next_hop, m, now)) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NEIGH);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1620,7 +1686,7 @@ static void send_outer_frame(struct tr_engine *e, int worker,
         return;
     }
     if (pkt_prepend(m, 14)) {
-        stats_drop(e, worker, under_slot);
+        stats_drop_reason(e, worker, under_slot, TR_DROP_FRAG);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1647,13 +1713,13 @@ static void tunnel_send(struct tr_engine *e, int worker,
     uint32_t len, max_inner;
 
     if (!iface || iface->kind != TR_IF_TUNNEL || !t->ready || !t->driver) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_TUNNEL);
         rte_pktmbuf_free(m);
         return;
     }
     max_inner = iface->mtu + ETH_HLEN + (pkt_tagged(m) ? 4 : 0);
     if (mlen(m) > max_inner || !pkt_single(m)) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_MTU);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1663,7 +1729,7 @@ static void tunnel_send(struct tr_engine *e, int worker,
         struct tr_fib_result res;
         if (fib_lookup_cached(e, worker, rt, &t->remote, &res) ||
             res.route->if_slot < 0) {
-            stats_drop(e, worker, if_slot);
+            stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
             rte_pktmbuf_free(m);
             return;
         }
@@ -1672,7 +1738,7 @@ static void tunnel_send(struct tr_engine *e, int worker,
     under = rt_iface(rt, under_slot);
     if (!under || (under->kind != TR_IF_ETHERNET &&
                    under->kind != TR_IF_VLAN)) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1682,13 +1748,13 @@ static void tunnel_send(struct tr_engine *e, int worker,
         bool prefer_ll = t->family == TR_AF_INET6 &&
                          tr_ip_is_linklocal(&t->remote);
         if (pick_addr(rt, under_slot, t->family, prefer_ll, &src)) {
-            stats_drop(e, worker, if_slot);
+            stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
             rte_pktmbuf_free(m);
             return;
         }
     }
     if (src.family != t->family || t->remote.family != t->family) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1712,7 +1778,7 @@ static void tunnel_send(struct tr_engine *e, int worker,
     frame.off = m->data_off;
     frame.len = mlen(m);
     if (t->driver->ops.encap(t->driver->ctx, &frame, &flow)) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_TUNNEL);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1722,7 +1788,7 @@ static void tunnel_send(struct tr_engine *e, int worker,
     under_mtu = under->mtu;
     len = mlen(m);
     if (underlay_next_hop(e, worker, rt, under_slot, &t->remote, &next_hop)) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1740,13 +1806,14 @@ static void tunnel_send(struct tr_engine *e, int worker,
                       TR_FRAG_MAX_OUT);
     rte_pktmbuf_free(m);
     if (nf <= 0) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_FRAG);
         return;
     }
     for (int i = 0; i < nf; i++) {
         struct rte_mbuf *fm = pkt_alloc(e, frags[i].len);
         if (!fm) {
             free(frags[i].data);
+            stats_drop_reason(e, worker, if_slot, TR_DROP_FRAG);
             continue;
         }
         memcpy(mtod(fm), frags[i].data, frags[i].len);
@@ -1799,14 +1866,14 @@ static void process_outer(struct tr_engine *e, int worker,
     const struct tr_iface *iface;
 
     if (tslot < 0) {
-        stats_drop(e, worker, ingress);
+        stats_drop_reason(e, worker, ingress, TR_DROP_NO_TUNNEL);
         rte_pktmbuf_free(m);
         return;
     }
     t = &rt->tunnel[tslot];
     iface = rt_iface(rt, tslot);
     if (!iface || !t->driver) {
-        stats_drop(e, worker, ingress);
+        stats_drop_reason(e, worker, ingress, TR_DROP_TUNNEL);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1817,13 +1884,13 @@ static void process_outer(struct tr_engine *e, int worker,
     frame.off = m->data_off + l3off;
     frame.len = ip_len;
     if (t->driver->ops.decap(t->driver->ctx, &frame, &flow)) {
-        stats_drop(e, worker, ingress);
+        stats_drop_reason(e, worker, ingress, TR_DROP_TUNNEL);
         rte_pktmbuf_free(m);
         return;
     }
     if (frame.len < ETH_HLEN ||
-        frame.len > iface->mtu + ETH_HLEN + 4) {
-        stats_drop(e, worker, ingress);
+        frame.len > iface->mtu + ETH_HLEN + 8) {
+        stats_drop_reason(e, worker, ingress, TR_DROP_MTU);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1929,7 +1996,7 @@ static void handle_arp(struct tr_engine *e, int worker,
     rte_pktmbuf_free(m);
     return;
 drop:
-    stats_drop(e, worker, if_slot);
+    stats_drop_reason(e, worker, if_slot, TR_DROP_RX_MALFORMED);
     rte_pktmbuf_free(m);
 }
 
@@ -2155,7 +2222,7 @@ static void handle_icmp6(struct tr_engine *e, int worker,
         return;
     }
 drop:
-    stats_drop(e, worker, if_slot);
+    stats_drop_reason(e, worker, if_slot, TR_DROP_RX_MALFORMED);
     rte_pktmbuf_free(m);
 }
 
@@ -2223,7 +2290,7 @@ static void handle_icmp4(struct tr_engine *e, int worker,
     rte_pktmbuf_free(m);
     return;
 drop:
-    stats_drop(e, worker, if_slot);
+    stats_drop_reason(e, worker, if_slot, TR_DROP_RX_MALFORMED);
     rte_pktmbuf_free(m);
 }
 
@@ -2246,7 +2313,7 @@ static void l3_forward4(struct tr_engine *e, int worker,
         if (p[9] == IPPROTO_ICMP) {
             handle_icmp4(e, worker, rt, if_slot, m, l3off, ip);
         } else {
-            stats_drop(e, worker, if_slot);
+            stats_drop_reason(e, worker, if_slot, TR_DROP_RX_TYPE);
             rte_pktmbuf_free(m);
         }
         return;
@@ -2255,20 +2322,20 @@ static void l3_forward4(struct tr_engine *e, int worker,
         res.route->if_slot < 0) {
         send_icmp4_error(e, worker, rt, if_slot, m, l3off,
                          ICMP_DEST_UNREACH, 0, 0);
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
         rte_pktmbuf_free(m);
         return;
     }
     egress = rt_iface(rt, res.route->if_slot);
     if (!egress) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
         rte_pktmbuf_free(m);
         return;
     }
     if (ttl <= 1) {
         send_icmp4_error(e, worker, rt, if_slot, m, l3off,
                          ICMP_TIME_EXCEEDED, 0, 0);
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_TTL);
         rte_pktmbuf_free(m);
         return;
     }
@@ -2277,14 +2344,14 @@ static void l3_forward4(struct tr_engine *e, int worker,
             send_icmp4_error(e, worker, rt, if_slot, m, l3off,
                              ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
                              (uint16_t)egress->mtu);
-            stats_drop(e, worker, if_slot);
+            stats_drop_reason(e, worker, if_slot, TR_DROP_DF);
             rte_pktmbuf_free(m);
             return;
         }
         struct tr_frag_packet frags[TR_FRAG_MAX_OUT];
         int nf = tr_frag4(ip, ip_len, egress->mtu, frags, TR_FRAG_MAX_OUT);
         if (nf <= 0) {
-            stats_drop(e, worker, if_slot);
+            stats_drop_reason(e, worker, if_slot, TR_DROP_FRAG);
             rte_pktmbuf_free(m);
             return;
         }
@@ -2313,7 +2380,9 @@ static void l3_forward4(struct tr_engine *e, int worker,
         p[10] = 0;
         p[11] = 0;
         m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
-        m->l2_len = egress->kind == TR_IF_VLAN ? 18 : 14;
+        m->l2_len = egress->kind == TR_IF_VLAN
+                        ? (egress->vlan_outer >= 0 ? 22 : 18)
+                        : 14;
         m->l3_len = (uint16_t)((p[0] & 0x0f) * 4);
     } else {
         /* Only the TTL halfword changed (the header checksum was verified on
@@ -2348,7 +2417,7 @@ static void l3_forward6(struct tr_engine *e, int worker,
         if (p[6] == IPPROTO_ICMPV6) {
             handle_icmp6(e, worker, rt, if_slot, m, l3off, ip, plen);
         } else {
-            stats_drop(e, worker, if_slot);
+            stats_drop_reason(e, worker, if_slot, TR_DROP_RX_TYPE);
             rte_pktmbuf_free(m);
         }
         return;
@@ -2357,27 +2426,27 @@ static void l3_forward6(struct tr_engine *e, int worker,
         res.route->if_slot < 0) {
         send_icmp6_error(e, worker, rt, if_slot, m, l3off,
                          ICMPV6_DEST_UNREACH, 0, 0);
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
         rte_pktmbuf_free(m);
         return;
     }
     egress = rt_iface(rt, res.route->if_slot);
     if (!egress) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_NO_ROUTE);
         rte_pktmbuf_free(m);
         return;
     }
     if (p[7] <= 1) {
         send_icmp6_error(e, worker, rt, if_slot, m, l3off,
                          ICMPV6_TIME_EXCEEDED, 0, 0);
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_TTL);
         rte_pktmbuf_free(m);
         return;
     }
     if (plen > egress->mtu) {
         send_icmp6_error(e, worker, rt, if_slot, m, l3off,
                          ICMPV6_PACKET_TOO_BIG, 0, egress->mtu);
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_MTU);
         rte_pktmbuf_free(m);
         return;
     }
@@ -2397,25 +2466,34 @@ static void l3_ingress(struct tr_engine *e, int worker,
     uint32_t len;
     uint16_t type;
     uint32_t l3off = ETH_HLEN;
+    enum tr_drop_reason why = TR_DROP_RX_TYPE;
 
     if (!iface) {
         rte_pktmbuf_free(m);
         return;
     }
     len = mlen(m);
-    if (len < ETH_HLEN)
+    if (len < ETH_HLEN) {
+        why = TR_DROP_RX_SHORT;
         goto drop;
+    }
     if (tagged) {
         uint16_t vid;
-        if (pkt_strip_vlan(m, &vid))
+        if (pkt_strip_vlan(m, &vid)) {
+            why = TR_DROP_RX_MALFORMED;
             goto drop;
+        }
         len = mlen(m);
     }
     p = mtod(m);
-    if (len < ETH_HLEN)
+    if (len < ETH_HLEN) {
+        why = TR_DROP_RX_SHORT;
         goto drop;
-    if (!tr_mac_is_multicast(p) && memcmp(p, iface->mac, 6) != 0)
+    }
+    if (!tr_mac_is_multicast(p) && memcmp(p, iface->mac, 6) != 0) {
+        why = TR_DROP_RX_MAC;
         goto drop;
+    }
     type = (uint16_t)(p[12] << 8 | p[13]);
     if (type == ETH_TYPE_ARP) {
         handle_arp(e, worker, rt, if_slot, m);
@@ -2423,19 +2501,27 @@ static void l3_ingress(struct tr_engine *e, int worker,
     }
     if (type == ETH_TYPE_IPV4) {
         uint32_t total;
-        if (len < l3off + 20)
+        if (len < l3off + 20) {
+            why = TR_DROP_RX_SHORT;
             goto drop;
+        }
         uint8_t *ip = p + l3off;
         uint32_t ihl = (uint32_t)(ip[0] & 0x0f) * 4;
-        if ((ip[0] >> 4) != 4 || ihl < 20 || len < l3off + ihl)
+        if ((ip[0] >> 4) != 4 || ihl < 20 || len < l3off + ihl) {
+            why = TR_DROP_RX_MALFORMED;
             goto drop;
+        }
         if ((m->ol_flags & RTE_MBUF_F_RX_IP_CKSUM_MASK) !=
                 RTE_MBUF_F_RX_IP_CKSUM_GOOD &&
-            tr_checksum16(ip, ihl, 0) != 0)
+            tr_checksum16(ip, ihl, 0) != 0) {
+            why = TR_DROP_RX_CKSUM;
             goto drop;
+        }
         total = (uint32_t)(ip[2] << 8 | ip[3]);
-        if (total < ihl || l3off + total > len)
+        if (total < ihl || l3off + total > len) {
+            why = TR_DROP_RX_MALFORMED;
             goto drop;
+        }
         if (len > l3off + total)
             rte_pktmbuf_trim(m, (uint16_t)(len - l3off - total));
         if (ip[9] == IPPROTO_ETHERIP) {
@@ -2473,17 +2559,23 @@ static void l3_ingress(struct tr_engine *e, int worker,
         return;
     }
     if (type == ETH_TYPE_IPV6) {
-        if (len < l3off + 40)
+        if (len < l3off + 40) {
+            why = TR_DROP_RX_SHORT;
             goto drop;
+        }
         uint8_t *ip = p + l3off;
         uint32_t plen = (uint32_t)(ip[4] << 8 | ip[5]);
-        if ((ip[0] >> 4) != 6 || l3off + 40 + plen > len)
+        if ((ip[0] >> 4) != 6 || l3off + 40 + plen > len) {
+            why = TR_DROP_RX_MALFORMED;
             goto drop;
+        }
         if (len > l3off + 40 + plen)
             rte_pktmbuf_trim(m, (uint16_t)(len - l3off - 40 - plen));
         if (ip[6] == IPPROTO_FRAGMENT) {
-            if (plen < 8)
+            if (plen < 8) {
+                why = TR_DROP_RX_MALFORMED;
                 goto drop;
+            }
             uint8_t *fh = ip + 40;
             uint16_t fo = (uint16_t)(fh[2] << 8 | fh[3]);
             uint32_t frag_off = fo & 0xfff8;
@@ -2491,8 +2583,10 @@ static void l3_ingress(struct tr_engine *e, int worker,
             uint32_t id = (uint32_t)fh[4] << 24 | (uint32_t)fh[5] << 16 |
                           (uint32_t)fh[6] << 8 | fh[7];
             uint8_t nh = fh[0];
-            if (nh != IPPROTO_ETHERIP)
+            if (nh != IPPROTO_ETHERIP) {
+                why = TR_DROP_RX_TYPE;
                 goto drop;
+            }
             struct tr_ip src, dst;
             struct tr_reasm_out out = {0};
             src.family = TR_AF_INET6;
@@ -2538,7 +2632,7 @@ static void l3_ingress(struct tr_engine *e, int worker,
         return;
     }
 drop:
-    stats_drop(e, worker, if_slot);
+    stats_drop_reason(e, worker, if_slot, why);
     rte_pktmbuf_free(m);
 }
 
@@ -2581,20 +2675,22 @@ static void bridge_ingress(struct tr_engine *e, int worker,
     rte_pktmbuf_free(m);
     return;
 drop:
-    stats_drop(e, worker, if_slot);
+    stats_drop_reason(e, worker, if_slot, TR_DROP_BRIDGE);
     rte_pktmbuf_free(m);
 }
 
-static int rt_vlan_lookup(const struct tr_runtime *rt, int parent, uint16_t vid)
+static int rt_vlan_lookup(const struct tr_runtime *rt, int parent,
+                          uint16_t outer, uint16_t inner)
 {
-    unsigned h = (unsigned)((parent * 4096 + vid) * 2654435761u) &
+    unsigned h = (unsigned)(((parent * 4096 + outer) * 2654435761u) ^ inner) &
                  (TR_VLAN_MAP_SIZE - 1);
     for (int probe = 0; probe < TR_VLAN_MAP_SIZE; probe++) {
         const struct tr_vlan_map_entry *entry =
             &rt->vlan_map[(h + (unsigned)probe) & (TR_VLAN_MAP_SIZE - 1)];
         if (!entry->used)
             return -1;
-        if (entry->parent == parent && entry->vid == vid)
+        if (entry->parent == parent && entry->outer == outer &&
+            entry->inner == inner)
             return entry->child;
     }
     return -1;
@@ -2611,7 +2707,7 @@ static void engine_input_slot(struct tr_engine *e, int worker,
         return;
     }
     if (mlen(m) < ETH_HLEN) {
-        stats_drop(e, worker, if_slot);
+        stats_drop_reason(e, worker, if_slot, TR_DROP_RX_SHORT);
         rte_pktmbuf_free(m);
         return;
     }
@@ -2620,11 +2716,23 @@ static void engine_input_slot(struct tr_engine *e, int worker,
     bool tagged = pkt_tagged(m);
     if (iface->kind == TR_IF_ETHERNET && tagged) {
         uint8_t *p = mtod(m);
-        uint16_t vid = (uint16_t)((p[14] << 8 | p[15]) & 0x0fff);
-        int child = rt_vlan_lookup(rt, if_slot, vid);
+        bool qinq = p[12] == (ETH_TYPE_QINQ >> 8) && p[13] == 0xa8;
+        uint16_t outer, inner = 0;
+        int child = -1;
+        if (qinq) {
+            if (mlen(m) < 22 ||
+                p[16] != (ETH_TYPE_VLAN >> 8) || p[17] != 0x00)
+                goto unknown_vlan;
+            outer = (uint16_t)((p[14] << 8 | p[15]) & 0x0fff);
+            inner = (uint16_t)((p[18] << 8 | p[19]) & 0x0fff);
+            child = rt_vlan_lookup(rt, if_slot, outer, inner);
+        } else {
+            outer = (uint16_t)((p[14] << 8 | p[15]) & 0x0fff);
+            child = rt_vlan_lookup(rt, if_slot, outer, 0);
+        }
         if (child >= 0) {
-            if (pkt_strip_vlan(m, NULL)) {
-                stats_drop(e, worker, if_slot);
+            if (qinq ? pkt_strip_qinq(m) : pkt_strip_vlan(m, NULL)) {
+                stats_drop_reason(e, worker, if_slot, TR_DROP_RX_MALFORMED);
                 rte_pktmbuf_free(m);
                 return;
             }
@@ -2632,15 +2740,16 @@ static void engine_input_slot(struct tr_engine *e, int worker,
             if_slot = child;
             iface = rt_iface(rt, child);
             if (!iface) {
-                stats_drop(e, worker, if_slot);
+                stats_drop_reason(e, worker, if_slot, TR_DROP_OTHER);
                 rte_pktmbuf_free(m);
                 return;
             }
-            /* Logical VLAN tap: untagged frame selected by the tag. */
+            /* Logical VLAN tap: untagged frame selected by the tags. */
             if (pkt_capture_on(e, worker))
                 tr_capture_tap_exact(e->capture, if_slot, TR_CAP_RX, m);
         }
     }
+unknown_vlan:
     if (iface->bridge >= 0)
         bridge_ingress(e, worker, rt, if_slot, m);
     else
@@ -3428,6 +3537,7 @@ int tr_engine_stats_text(struct tr_engine *e, char **out)
             continue;
         uint64_t rx = 0, tx = 0, drop = 0, bytes = 0, arp = 0, ndp = 0,
                  frag = 0, reasm = 0, fail = 0, mss = 0;
+        uint64_t why[TR_DROP_COUNT] = {0};
         for (int w = 0; w < e->workers; w++) {
             const struct tr_if_stats *s = &e->stats[i][w];
             rx += atomic_load_explicit(&s->rx_pkts, memory_order_relaxed);
@@ -3442,6 +3552,9 @@ int tr_engine_stats_text(struct tr_engine *e, char **out)
                                          memory_order_relaxed);
             mss += atomic_load_explicit(&s->mss_clamped,
                                         memory_order_relaxed);
+            for (int r = 0; r < TR_DROP_COUNT; r++)
+                why[r] += atomic_load_explicit(&s->drop_reason[r],
+                                               memory_order_relaxed);
         }
         fprintf(f, "%-16s %10llu %10llu %10llu %10llu %8llu %8llu %8llu\n",
                 e->rt->cfg.ifaces[i].name, (unsigned long long)rx,
@@ -3452,6 +3565,23 @@ int tr_engine_stats_text(struct tr_engine *e, char **out)
             fprintf(f, "  reassembled %llu failed %llu mss-clamped %llu\n",
                     (unsigned long long)reasm, (unsigned long long)fail,
                     (unsigned long long)mss);
+        /* Drop breakdown: only the reasons that actually fired.  This is what
+         * separates "the underlay is full of packets we do not route" from
+         * "our own frames are too big for the egress MTU". */
+        if (drop) {
+            bool first = true;
+
+            for (int r = 0; r < TR_DROP_COUNT; r++) {
+                if (!why[r])
+                    continue;
+                fprintf(f, first ? "  drops:" : ",");
+                fprintf(f, " %s %llu", tr_drop_reason_name(r),
+                        (unsigned long long)why[r]);
+                first = false;
+            }
+            if (!first)
+                fprintf(f, "\n");
+        }
     }
     pthread_rwlock_unlock(&e->rt_lock);
     fclose(f);

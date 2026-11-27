@@ -13,6 +13,8 @@ static const char *commands[] = {
     "set interfaces ethernet eth1 mtu 1400",
     "set interfaces ethernet eth0 vlan-id 10 mtu 1400",
     "set interfaces ethernet eth0 vlan-id 10 address 192.168.10.1/24",
+    "set interfaces ethernet eth0 vlan-s 100 vlan-c 200 mtu 1400",
+    "set interfaces ethernet eth0 vlan-s 100 vlan-c 200 address 192.168.200.1/24",
     "set interfaces bridge br0 children eth1",
     "set interfaces bridge br0 mtu 1400",
     "set interfaces tunnel tun0 encapsulation etherip6",
@@ -64,6 +66,11 @@ static int test_parse_and_serialize(void)
     CHECK(vlan != NULL && vlan->kind == TR_IF_VLAN && vlan->vlan_id == 10);
     CHECK(vlan->mtu == 1400 && vlan->naddrs == 1);
 
+    const struct tr_iface *qinq = tr_config_find_const(&cfg, "eth0.100.200");
+    CHECK(qinq != NULL && qinq->kind == TR_IF_VLAN);
+    CHECK(qinq->vlan_outer == 100 && qinq->vlan_id == 200);
+    CHECK(qinq->mtu == 1400 && qinq->naddrs == 1);
+
     const struct tr_iface *br = tr_config_find_const(&cfg, "br0");
     CHECK(br != NULL && br->kind == TR_IF_BRIDGE && br->nchildren == 1);
     CHECK(br->children[0] == tr_config_find_const(&cfg, "eth1")->slot);
@@ -91,6 +98,8 @@ static int test_parse_and_serialize(void)
     CHECK(text != NULL);
     CHECK(strstr(text, "set interfaces ethernet eth0 port 0") != NULL);
     CHECK(strstr(text, "set interfaces ethernet eth0 vlan-id 10") != NULL);
+    CHECK(strstr(text, "set interfaces ethernet eth0 vlan-s 100 vlan-c 200") !=
+          NULL);
     CHECK(strstr(text, "set interfaces bridge br0 children eth1") != NULL);
     CHECK(strstr(text, "set interfaces tunnel tun0 remote 2001:db8:2::2") != NULL);
     CHECK(strstr(text, "set protocols static route 0.0.0.0/0 via 192.0.2.254") != NULL);

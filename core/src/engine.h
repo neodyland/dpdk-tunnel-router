@@ -12,12 +12,37 @@
 
 struct tr_engine;
 
+/* Why a packet was discarded.  `drops` is the sum over these reasons, so an
+ * operator can tell "the underlay is full of noise" from "our own frames are
+ * too big" instead of staring at a single opaque counter. */
+enum tr_drop_reason {
+    TR_DROP_RX_SHORT = 0, /* runt or truncated frame */
+    TR_DROP_RX_MAC,       /* destination MAC is not ours */
+    TR_DROP_RX_TYPE,      /* unhandled EtherType or L4 protocol */
+    TR_DROP_RX_CKSUM,     /* IPv4 header checksum mismatch */
+    TR_DROP_RX_MALFORMED, /* bad version, length or fragment header */
+    TR_DROP_NO_ROUTE,     /* no FIB route or unusable egress */
+    TR_DROP_MTU,          /* egress frame exceeds the interface MTU */
+    TR_DROP_DF,           /* DF set and packet exceeds egress MTU */
+    TR_DROP_TTL,          /* TTL / hop limit expired */
+    TR_DROP_NEIGH,        /* next hop unresolved and queue full */
+    TR_DROP_FRAG,         /* fragmentation or headroom failure */
+    TR_DROP_TUNNEL,       /* tunnel not ready, encap or decap failure */
+    TR_DROP_NO_TUNNEL,    /* outer packet matched no tunnel */
+    TR_DROP_BRIDGE,       /* bridge member or MTU drop */
+    TR_DROP_OTHER,        /* uncategorised */
+    TR_DROP_COUNT
+};
+
+const char *tr_drop_reason_name(int reason);
+
 struct tr_if_stats {
     _Atomic uint64_t rx_pkts;
     _Atomic uint64_t rx_bytes;
     _Atomic uint64_t tx_pkts;
     _Atomic uint64_t tx_bytes;
     _Atomic uint64_t drops;
+    _Atomic uint64_t drop_reason[TR_DROP_COUNT];
     _Atomic uint64_t arp_tx;
     _Atomic uint64_t ndp_tx;
     _Atomic uint64_t frag_tx;

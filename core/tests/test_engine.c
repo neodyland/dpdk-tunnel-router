@@ -365,6 +365,126 @@ static int test_checksum(void)
     return 0;
 }
 
+/* Parse "<name> <count>" out of the per-interface drop breakdown printed by
+ * tr_engine_stats_text(). */
+static unsigned long long stat_reason(const char *text, const char *name)
+{
+    const char *p = text;
+    size_t nlen = strlen(name);
+
+    while ((p = strstr(p, name)) != NULL) {
+        bool start_ok =
+            p == text || p[-1] == ' ' || p[-1] == ':' || p[-1] == ',';
+        if (start_ok && p[nlen] == ' ')
+            return strtoull(p + nlen + 1, NULL, 10);
+        p += nlen;
+    }
+    return 0;
+}
+
+/* The aggregate drop counter alone cannot tell an operator whether the
+ * underlay is full of unrouteable noise or our own frames are too big, so each
+ * reject path must be attributed. */
+static int test_drop_reasons(struct rte_mempool *mp, struct capture *cap)
+{
+    struct tr_config cfg, env_cfg;
+    struct tr_config_env env;
+    struct tr_engine *e;
+    char err[256];
+    const uint8_t eth0_mac[6] = {0x02, 0, 0, 0, 0, 1};
+    const uint8_t eth1_mac[6] = {0x02, 0, 0, 0, 0, 2};
+    const uint8_t peer_mac[6] = {0x02, 0, 0, 0, 0, 0xbb};
+    const uint8_t other_mac[6] = {0x02, 0, 0, 0, 0, 0x99};
+    struct tr_ip src, dst, no_route;
+    uint8_t payload[1000];
+    char *out = NULL;
+
+    memset(payload, 0x5a, sizeof(payload));
+    setup_config(&cfg, &env);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth0 port 0") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0 address 192.0.2.1/24") == 0);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth1 port 1") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth1 address 198.51.100.1/24") == 0);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth1 mtu 600") == 0);
+    CHECK(set_mac(&cfg, "eth0", eth0_mac) == 0);
+    CHECK(set_mac(&cfg, "eth1", eth1_mac) == 0);
+    e = tr_engine_create(&(struct tr_engine_params){.n_ports = 2,
+                                                    .workers = 1,
+                                                    .mp = mp},
+                         err, sizeof(err));
+    CHECK(e != NULL);
+    tr_engine_set_tx(e, capture_tx, cap);
+    CHECK(tr_engine_apply(e, &cfg, err, sizeof(err)) == 0);
+    tr_engine_config_copy(e, &env_cfg);
+    int eth0 = tr_config_find_const(&env_cfg, "eth0")->slot;
+    int eth1 = tr_config_find_const(&env_cfg, "eth1")->slot;
+
+    /* Resolve the next hop on eth1 so that only the intended check fires. */
+    struct in_addr spa, tpa;
+    inet_pton(AF_INET, "198.51.100.2", &spa);
+    inet_pton(AF_INET, "198.51.100.1", &tpa);
+    CHECK(build_arp(mp, eth1_mac, peer_mac, 2, peer_mac, &spa, eth1_mac,
+                    &tpa) != NULL);
+    struct rte_mbuf *arp = build_arp(mp, eth1_mac, peer_mac, 2, peer_mac, &spa,
+                                     eth1_mac, &tpa);
+    CHECK(arp != NULL);
+    CHECK(tr_engine_input(e, 0, eth1, arp) == 0);
+    capture_reset(cap);
+
+    tr_ip_parse("192.0.2.2", &src);
+    tr_ip_parse("198.51.100.2", &dst);
+    tr_ip_parse("203.0.113.9", &no_route);
+
+    /* Destination MAC is not ours. */
+    struct rte_mbuf *m =
+        build_ipv4(mp, other_mac, peer_mac, &src, &dst, 64, 17, payload, 8, 1);
+    CHECK(m != NULL);
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+
+    /* Broken IPv4 header checksum. */
+    m = build_ipv4(mp, eth0_mac, peer_mac, &src, &dst, 64, 17, payload, 8, 1);
+    CHECK(m != NULL);
+    mtod(m)[14 + 10] ^= 0xff;
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+
+    /* Runt frame. */
+    m = alloc_frame(mp, 10);
+    CHECK(m != NULL);
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+
+    /* No route to the destination (ICMP unreachable is generated). */
+    m = build_ipv4(mp, eth0_mac, peer_mac, &src, &no_route, 64, 17, payload, 8,
+                   1);
+    CHECK(m != NULL);
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+
+    /* DF set and the packet exceeds the egress MTU (600). */
+    m = build_ipv4(mp, eth0_mac, peer_mac, &src, &dst, 64, 17, payload, 1000,
+                   1);
+    CHECK(m != NULL);
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+
+    capture_reset(cap);
+    CHECK(tr_engine_stats_text(e, &out) == 0);
+    CHECK(out != NULL);
+    CHECK(stat_reason(out, "rx-mac") == 1);
+    CHECK(stat_reason(out, "rx-cksum") == 1);
+    CHECK(stat_reason(out, "rx-short") == 1);
+    CHECK(stat_reason(out, "no-route") == 1);
+    CHECK(stat_reason(out, "df") == 1);
+    /* Every drop must be attributed: the per-reason counts add up. */
+    unsigned long long total = 0;
+    for (int r = 0; r < TR_DROP_COUNT; r++)
+        total += stat_reason(out, tr_drop_reason_name(r));
+    CHECK(total >= 5);
+    free(out);
+
+    tr_engine_destroy(e);
+    return 0;
+}
+
 static int test_arp(struct rte_mempool *mp, struct capture *cap)
 {
     struct tr_config cfg, env_cfg;
@@ -1027,6 +1147,75 @@ static int test_vlan(struct rte_mempool *mp, struct capture *cap)
     CHECK((p[14] & 0x0f) == 0 && p[15] == 10);
     CHECK((p[16] << 8 | p[17]) == 0x0806);
     CHECK((p[24] << 8 | p[25]) == 2);
+    capture_reset(cap);
+    tr_engine_destroy(e);
+    return 0;
+}
+
+static int test_qinq(struct rte_mempool *mp, struct capture *cap)
+{
+    struct tr_config cfg, env_cfg;
+    struct tr_config_env env;
+    struct tr_engine *e;
+    char err[256];
+    const uint8_t eth0_mac[6] = {0x02, 0, 0, 0, 0, 1};
+    const uint8_t peer_mac[6] = {0x02, 0, 0, 0, 0, 0xee};
+
+    setup_config(&cfg, &env);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth0 port 0") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0 vlan-s 100 vlan-c 200 "
+                        "address 192.168.200.1/24") == 0);
+    CHECK(set_mac(&cfg, "eth0", eth0_mac) == 0);
+    struct tr_iface *qinq = tr_config_find(&cfg, "eth0.100.200");
+    CHECK(qinq != NULL && qinq->vlan_outer == 100 && qinq->vlan_id == 200);
+    memcpy(qinq->mac, eth0_mac, 6);
+    e = tr_engine_create(&(struct tr_engine_params){.n_ports = 2,
+                                                    .workers = 1,
+                                                    .mp = mp},
+                         err, sizeof(err));
+    CHECK(e != NULL);
+    tr_engine_set_tx(e, capture_tx, cap);
+    CHECK(tr_engine_apply(e, &cfg, err, sizeof(err)) == 0);
+    tr_engine_config_copy(e, &env_cfg);
+    int eth0 = tr_config_find_const(&env_cfg, "eth0")->slot;
+    int qinq_slot = tr_config_find_const(&env_cfg, "eth0.100.200")->slot;
+
+    struct rte_mbuf *m = alloc_frame(mp, 14 + 8 + 28);
+    CHECK(m != NULL);
+    uint8_t *p = mtod(m);
+    eth_fill(p, eth0_mac, peer_mac, 0x88a8);
+    p[14] = 0;
+    p[15] = 100;
+    p[16] = 0x81;
+    p[17] = 0x00;
+    p[18] = 0;
+    p[19] = 200;
+    p[20] = 0x08;
+    p[21] = 0x06;
+    uint8_t *arp = p + 22;
+    arp[0] = 0;
+    arp[1] = 1;
+    arp[2] = 0x08;
+    arp[3] = 0;
+    arp[4] = 6;
+    arp[5] = 4;
+    arp[7] = 1;
+    memcpy(arp + 8, peer_mac, 6);
+    inet_pton(AF_INET, "192.168.200.2", arp + 14);
+    memset(arp + 18, 0, 6);
+    inet_pton(AF_INET, "192.168.200.1", arp + 24);
+    capture_reset(cap);
+    CHECK(tr_engine_input(e, 0, eth0, m) == 0);
+    CHECK(cap->n == 1);
+    CHECK(cap->slot[0] == qinq_slot);
+    p = mtod(cap->m[0]);
+    CHECK((p[12] << 8 | p[13]) == 0x88a8);
+    CHECK((p[14] & 0x0f) == 0 && p[15] == 100);
+    CHECK((p[16] << 8 | p[17]) == 0x8100);
+    CHECK((p[18] & 0x0f) == 0 && p[19] == 200);
+    CHECK((p[20] << 8 | p[21]) == 0x0806);
+    CHECK((p[28] << 8 | p[29]) == 2);
     capture_reset(cap);
     tr_engine_destroy(e);
     return 0;
@@ -1719,6 +1908,7 @@ int main(void)
     struct capture cap = {0};
     int rc = 0;
     rc |= test_checksum();
+    rc |= test_drop_reasons(mp, &cap);
     rc |= test_arp(mp, &cap);
     rc |= test_ipv4_route(mp, &cap);
     rc |= test_ndp(mp, &cap);
@@ -1726,6 +1916,7 @@ int main(void)
     rc |= test_mss_clamp_decap(mp, &cap);
     rc |= test_vlan(mp, &cap);
     rc |= test_vlan_autoconf(mp, &cap);
+    rc |= test_qinq(mp, &cap);
     rc |= test_bridge(mp, &cap);
     rc |= test_autoconf(mp, &cap);
     rc |= test_ping(mp, &cap);

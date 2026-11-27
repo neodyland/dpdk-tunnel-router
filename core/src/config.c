@@ -14,6 +14,7 @@ void tr_config_iface_clear(struct tr_iface *iface)
     iface->mtu = 1500;
     iface->port_id = -1;
     iface->vlan_id = -1;
+    iface->vlan_outer = -1;
     iface->parent = -1;
     iface->bridge = -1;
     iface->tunnel.tcp_mss = -1;
@@ -251,6 +252,46 @@ struct tr_iface *tr_config_ensure_vlan(struct tr_config *cfg,
         return NULL;
     vlan->parent = parent->slot;
     vlan->vlan_id = vlan_id;
+    vlan->vlan_outer = -1;
+    vlan->mtu = parent->mtu;
+    return vlan;
+}
+
+struct tr_iface *tr_config_ensure_qinq(struct tr_config *cfg,
+                                       struct tr_iface *parent, int outer,
+                                       int inner, char *err, size_t errlen)
+{
+    char name[64];
+    struct tr_iface *vlan;
+
+    if (!parent || parent->kind != TR_IF_ETHERNET) {
+        snprintf(err, errlen, "vlan-s requires an ethernet interface");
+        return NULL;
+    }
+    if (outer < 1 || outer > 4094 || inner < 1 || inner > 4094) {
+        snprintf(err, errlen, "Q-in-Q VLAN IDs must be 1..4094");
+        return NULL;
+    }
+    snprintf(name, sizeof(name), "%s.%d.%d", parent->name, outer, inner);
+    if (strlen(name) >= TR_IFNAME_LEN) {
+        snprintf(err, errlen, "Q-in-Q interface name is too long");
+        return NULL;
+    }
+    vlan = tr_config_find(cfg, name);
+    if (vlan) {
+        if (vlan->kind != TR_IF_VLAN || vlan->parent != parent->slot ||
+            vlan->vlan_outer != outer || vlan->vlan_id != inner) {
+            snprintf(err, errlen, "interface '%s' already exists", name);
+            return NULL;
+        }
+        return vlan;
+    }
+    vlan = tr_config_create(cfg, name, TR_IF_VLAN, err, errlen);
+    if (!vlan)
+        return NULL;
+    vlan->parent = parent->slot;
+    vlan->vlan_outer = outer;
+    vlan->vlan_id = inner;
     vlan->mtu = parent->mtu;
     return vlan;
 }
@@ -468,7 +509,9 @@ int tr_config_validate(const struct tr_config *cfg,
                          iface->name);
                 return -1;
             }
-            if (iface->vlan_id < 1 || iface->vlan_id > 4094) {
+            if (iface->vlan_id < 1 || iface->vlan_id > 4094 ||
+                (iface->vlan_outer >= 0 &&
+                 (iface->vlan_outer < 1 || iface->vlan_outer > 4094))) {
                 snprintf(err, errlen, "%s: invalid VLAN ID", iface->name);
                 return -1;
             }

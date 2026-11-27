@@ -47,6 +47,36 @@ static bool parse_dotted_vlan(const char *name, char *parent, size_t plen,
     return true;
 }
 
+static bool parse_dotted_qinq(const char *name, char *parent, size_t plen,
+                              int *outer, int *inner)
+{
+    const char *d1 = strchr(name, '.');
+    const char *d2 = strrchr(name, '.');
+    uint32_t o, i;
+
+    if (!d1 || !d2 || d1 == d2 || d1 == name || !d1[1] || !d2[1])
+        return false;
+    if (strchr(d1 + 1, '.') != d2)
+        return false;
+    size_t n = (size_t)(d1 - name);
+    if (n >= plen)
+        return false;
+    memcpy(parent, name, n);
+    parent[n] = '\0';
+    char obuf[16];
+    size_t olen = (size_t)(d2 - d1 - 1);
+    if (olen == 0 || olen >= sizeof(obuf))
+        return false;
+    memcpy(obuf, d1 + 1, olen);
+    obuf[olen] = '\0';
+    if (tr_parse_u32(obuf, 1, 4094, &o) ||
+        tr_parse_u32(d2 + 1, 1, 4094, &i))
+        return false;
+    *outer = (int)o;
+    *inner = (int)i;
+    return true;
+}
+
 static void print_prefixes(FILE *f, const struct tr_iface *iface,
                            const char *indent)
 {
@@ -201,6 +231,8 @@ static void ethernet_overview(FILE *f, const struct tr_config *cfg, int nports)
             "  set interfaces ethernet <name> address ipv6 autoconf\n"
             "  set interfaces ethernet <name> vlan-id <1..4094> "
             "address <prefix>\n"
+            "  set interfaces ethernet <name> vlan-s <1..4094> "
+            "vlan-c <1..4094> address <prefix>\n"
             "  set interfaces ethernet <name> vlan-id <1..4094> mtu <mtu>\n"
             "\n"
             "eth<N> is automatically mapped to DPDK port N when the port is\n"
@@ -225,16 +257,23 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
 {
     const struct tr_iface *iface = tr_config_find_const(cfg, name);
     char parent_name[TR_IFNAME_LEN] = "";
+    char qinq_parent[TR_IFNAME_LEN] = "";
     int dotted_vid = 0;
+    int qinq_outer = 0, qinq_inner = 0;
     bool dotted = false;
+    bool qdotted = false;
     int inferred = -1;
     bool can_infer = eth_name_port(name, &inferred);
 
-    if (!iface && parse_dotted_vlan(name, parent_name, sizeof(parent_name),
-                                    &dotted_vid))
+    if (!iface && parse_dotted_qinq(name, qinq_parent, sizeof(qinq_parent),
+                                    &qinq_outer, &qinq_inner))
+        qdotted = true;
+    else if (!iface &&
+             parse_dotted_vlan(name, parent_name, sizeof(parent_name),
+                               &dotted_vid))
         dotted = true;
     bool is_vlan = iface && iface->kind == TR_IF_VLAN;
-    bool vlan_like = is_vlan || dotted;
+    bool vlan_like = is_vlan || dotted || qdotted;
 
     if (iface && iface->kind != TR_IF_ETHERNET && !is_vlan) {
         fprintf(f, "Interface %s is not an Ethernet/VLAN interface.\n", name);
@@ -250,7 +289,11 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
         fprintf(f, "  ifindex: %d\n", iface->slot);
         fprintf(f, "  parent: %s\n",
                 parent ? parent->name : "(missing)");
-        fprintf(f, "  VLAN ID: %d\n", iface->vlan_id);
+        if (iface->vlan_outer >= 0)
+            fprintf(f, "  S-tag: %d  C-tag: %d\n", iface->vlan_outer,
+                    iface->vlan_id);
+        else
+            fprintf(f, "  VLAN ID: %d\n", iface->vlan_id);
         fprintf(f, "  MTU: %u\n", iface->mtu);
         fprintf(f, "  MAC: %s\n", mac);
         fprintf(f, "  addresses:\n");
@@ -287,6 +330,24 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
                 fprintf(f, "    %-16s mtu %u\n", v->name, v->mtu);
             }
         }
+    } else if (qdotted) {
+        const struct tr_iface *parent =
+            tr_config_find_const(cfg, qinq_parent);
+        fprintf(f, "Q-in-Q %s is not configured yet.\n", name);
+        fprintf(f, "  parent: %s  S-tag: %d  C-tag: %d\n", qinq_parent,
+                qinq_outer, qinq_inner);
+        if (!parent)
+            fprintf(f, "  Parent Ethernet '%s' does not exist.\n",
+                    qinq_parent);
+        else if (parent->kind != TR_IF_ETHERNET)
+            fprintf(f, "  Parent '%s' is not an Ethernet interface.\n",
+                    qinq_parent);
+        else
+            fprintf(f,
+                    "  Create it with vlan-s/vlan-c or address it directly:\n"
+                    "  set interfaces ethernet %s vlan-s %d vlan-c %d "
+                    "address 192.0.2.1/24\n",
+                    qinq_parent, qinq_outer, qinq_inner);
     } else if (dotted) {
         const struct tr_iface *parent =
             tr_config_find_const(cfg, parent_name);
@@ -362,7 +423,8 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
                     "\nport property is not valid on a VLAN child.\n"
                     "  Configure the parent Ethernet instead:\n"
                     "  set interfaces ethernet %s port <id>\n",
-                    dotted ? parent_name : "(parent)");
+                    qdotted ? qinq_parent
+                            : dotted ? parent_name : "(parent)");
             return;
         }
         fprintf(f,
@@ -389,7 +451,11 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
                 "\nvlan-id property:\n"
                 "  set interfaces ethernet %s vlan-id <1..4094> "
                 "address <prefix|ipv6 autoconf>\n"
-                "  set interfaces ethernet %s vlan-id <1..4094> mtu <mtu>\n\n"
+                "  set interfaces ethernet %s vlan-id <1..4094> mtu <mtu>\n"
+                "  set interfaces ethernet %s vlan-s <S> vlan-c <C> "
+                "address <prefix|ipv6 autoconf>\n"
+                "  set interfaces ethernet %s vlan-s <S> vlan-c <C> "
+                "mtu <mtu>\n\n"
                 "  - Creates a child interface named %s.<vid>.\n"
                 "  - The tag is terminated at the parent; L3/ARP/NDP runs on\n"
                 "    the child with an untagged logical frame.\n"
@@ -399,15 +465,19 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
                 "  - VLAN IDs are local to the parent interface.\n"
                 "  - The child can be addressed directly as "
                 "<parent>.<vid>, e.g.\n"
-                "    set interfaces ethernet eth0.10 address ipv6 autoconf\n\n"
+                "    set interfaces ethernet eth0.10 address ipv6 autoconf\n"
+                "  - Q-in-Q uses an 802.1ad S-tag and an 802.1Q C-tag.\n"
+                "    The child is named <parent>.<S>.<C>.\n\n"
                 "Examples:\n"
                 "  set interfaces ethernet %s vlan-id 10 address "
                 "192.168.10.1/24\n"
                 "  set interfaces ethernet %s vlan-id 10 address "
                 "ipv6 autoconf\n"
                 "  set interfaces ethernet %s.10 address ipv6 autoconf\n"
-                "  set interfaces ethernet %s vlan-id 20 mtu 1500\n",
-                name, name, name, name, name, name, name);
+                "  set interfaces ethernet %s vlan-id 20 mtu 1500\n"
+                "  set interfaces ethernet %s vlan-s 100 vlan-c 200 "
+                "address ipv6 autoconf\n",
+                name, name, name, name, name, name, name, name, name, name);
         return;
     }
 
@@ -440,6 +510,8 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
             "      IP MTU (default 1500).  Enforced in software.\n"
             "  vlan-id <1..4094> [address <prefix|ipv6 autoconf> | mtu <mtu>]\n"
             "      Create/configure child %s.<vid> with tag termination.\n"
+            "  vlan-s <S> vlan-c <C> [address <prefix|ipv6 autoconf> | mtu <mtu>]\n"
+            "      Create/configure Q-in-Q child %s.<S>.<C> (802.1ad + 802.1Q).\n"
             "  <name>.<vid> can also be used directly, e.g.\n"
             "      set interfaces ethernet eth0.10 address ipv6 autoconf\n\n"
             "Examples:\n"
@@ -447,9 +519,11 @@ static void ethernet_interface_help(FILE *f, const struct tr_config *cfg,
             "  set interfaces ethernet %s address 2001:db8:1::1/64\n"
             "  set interfaces ethernet %s address ipv6 autoconf\n"
             "  set interfaces ethernet %s vlan-id 10 address ipv6 autoconf\n"
+            "  set interfaces ethernet %s vlan-s 100 vlan-c 200 "
+            "address ipv6 autoconf\n"
             "  set interfaces ethernet %s mtu 9000\n",
             name, nports > 0 ? nports - 1 : 0, name, name, name, name, name,
-            name);
+            name, name, name);
 }
 
 static void tunnel_overview(FILE *f, const struct tr_config *cfg)

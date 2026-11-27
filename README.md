@@ -41,7 +41,7 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
 | TCP MSS clamping | `tcp-mss auto / none / N`。トンネルを出入りする SYN/SYN-ACK の MSS オプションを双方向で書き換え、TCP チェックサムを再計算 |
 | Ethernet ARP / NDP | ARP request/reply、NDP NS/NA、近隣キャッシュ、未解決パケットのキューイング、リンクローカル自動生成 |
 | IPv6 autoconf | `address ipv6 autoconf` で RA を受信し、SLAAC アドレスとデフォルトルートを動的にインストール |
-| VLAN | `set interfaces ethernet eth0 vlan-id 10 ...` で `eth0.10` を作成。タグ終端、L3、ブリッジメンバーに対応 |
+| VLAN / Q-in-Q | `vlan-id 10` で `eth0.10`、`vlan-s 100 vlan-c 200` で `eth0.100.200` を作成。802.1ad S-tag + 802.1Q C-tag、L3、ブリッジメンバーに対応 |
 | ブリッジ | MAC 学習、フラッディング、エージング。VLAN 子インタフェースやトンネルをメンバーにできる |
 | 静的ルート | IPv4/IPv6 の最長一致FIB。再帰的な next-hop 解決に対応 |
 | 並列処理 | DPDK RSS + マルチキュー + ワーカー lcore。パケット処理はロックなし、設定は reader gate 付きの不変スナップショット差し替え |
@@ -406,6 +406,9 @@ set interfaces ethernet <ethernet name> mtu <mtu>
 set interfaces ethernet <ethernet name> vlan-id <VLAN ID> address <prefix|ipv6 autoconf>
 set interfaces ethernet <ethernet name> vlan-id <VLAN ID> mtu <mtu>
 set interfaces ethernet <ethernet name>.<VLAN ID> address <prefix|ipv6 autoconf>  # alias
+set interfaces ethernet <ethernet name> vlan-s <S-tag> vlan-c <C-tag> address <prefix|ipv6 autoconf>
+set interfaces ethernet <ethernet name> vlan-s <S-tag> vlan-c <C-tag> mtu <mtu>
+set interfaces ethernet <ethernet name>.<S-tag>.<C-tag> address <prefix|ipv6 autoconf>  # alias
 
 set interfaces bridge <Bridge name> children <Interface name>
 set interfaces bridge <Bridge name> mtu <mtu>
@@ -430,6 +433,16 @@ set protocols static route <IPv4/IPv6 prefix> via <same-family next-hop>
 - VLAN 子でも IPv4/IPv6 の静的アドレスと `address ipv6 autoconf` が使えます。
   VLAN タグ付きの RA を受信すると、その VLAN に SLAAC アドレスと
   デフォルトルートをインストールします。
+- Q-in-Q は 802.1ad の S-tag と 802.1Q の C-tag を二重に付与します。
+  インタフェース名は `eth0.<S>.<C>`、直接指定も可能です。
+
+```sh
+set interfaces ethernet eth0 vlan-s 100 vlan-c 200 address 192.168.200.1/24
+set interfaces ethernet eth0.100.200 address ipv6 autoconf
+```
+
+- 受信時は S-tag / C-tag の両方が設定と一致する場合だけ Q-in-Q 子として
+  タグを終端します。
 - ブリッジの children は L2 インタフェース（Ethernet / VLAN / Tunnel）です。
   L3 アドレスを持つインタフェースはブリッジメンバーにできません。
 - `tcp-mss auto` はアンダーレイ MTU から外側ヘッダー、内側 Ethernet ヘッダー、
@@ -670,6 +683,38 @@ A/B を 4 回繰り返し、burst は **-33% 〜 -41%** の範囲で再現しま
 single は 1 パケットごとに時刻を取得する 1 パケット API の性質上、改善幅が
 小さくなります（本番のワーカーループは burst API を使います）。Mpps は
 同じ実行の最良ラウンドの値で、ホストの周波数依存があります。
+
+### 8.2 ドロップの内訳
+
+`show statistics` の `drops` は合計だけでなく、どの検査で捨てたかの内訳も
+表示します。合計は内訳の和と一致します。
+
+```text
+eth1              8762397          0    1112013 3402675689 ...
+  drops: rx-mac 2013, no-tunnel 1110000
+```
+
+| 理由 | 意味 |
+| --- | --- |
+| `rx-short` | 14 byte 未満のフレーム、切り詰められたフレーム |
+| `rx-mac` | 宛先 MAC が自分でもマルチキャストでもない |
+| `rx-type` | 扱わない EtherType / L4 プロトコル |
+| `rx-cksum` | IPv4 ヘッダチェックサム不一致 |
+| `rx-malformed` | バージョン・長さ・フラグメントヘッダー不正 |
+| `no-route` | 経路なし、または使用できる出力インタフェースなし |
+| `mtu` | 出力フレームがインタフェース MTU を超過 |
+| `df` | DF セットで出力 MTU 超過（ICMP frag needed を返却） |
+| `ttl` | TTL / hop limit 切れ |
+| `neigh` | next-hop 未解決でキュー（8 パケット）が満杯 |
+| `frag` | フラグメント生成失敗、ヘッドルーム不足、mbuf 不足 |
+| `tunnel` | トンネル未確立、カプセル化/デカプセル化失敗 |
+| `no-tunnel` | 外側パケットに一致するトンネルがない |
+| `bridge` | ブリッジメンバー不一致、ブリッジ MTU 超過 |
+| `other` | 上記以外 |
+
+`no-tunnel` が増える場合はアンダーレイに無関係なトラフィック（NDP/MLD/
+他のホスト宛）が届いています。`mtu` / `df` / `frag` が増える場合はトンネルや
+`tcp-mss` の設定とアンダーレイ MTU の整合を確認してください。
 
 ## 9. テスト
 

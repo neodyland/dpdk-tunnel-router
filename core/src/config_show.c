@@ -113,14 +113,27 @@ int tr_config_serialize(const struct tr_config *cfg, char **out)
             if (!vlan->present || vlan->kind != TR_IF_VLAN ||
                 vlan->parent != iface->slot)
                 continue;
-            if (sb_appendf(&sb,
-                           "set interfaces ethernet %s vlan-id %d mtu %u\n",
-                           iface->name, vlan->vlan_id, vlan->mtu))
-                goto fail;
-            char vpfx[TR_IFNAME_LEN + 32];
-            snprintf(vpfx, sizeof(vpfx),
-                     "set interfaces ethernet %s vlan-id %d", iface->name,
-                     vlan->vlan_id);
+            char vpfx[TR_IFNAME_LEN + 48];
+            if (vlan->vlan_outer >= 0) {
+                if (sb_appendf(&sb,
+                               "set interfaces ethernet %s vlan-s %d "
+                               "vlan-c %d mtu %u\n",
+                               iface->name, vlan->vlan_outer, vlan->vlan_id,
+                               vlan->mtu))
+                    goto fail;
+                snprintf(vpfx, sizeof(vpfx),
+                         "set interfaces ethernet %s vlan-s %d vlan-c %d",
+                         iface->name, vlan->vlan_outer, vlan->vlan_id);
+            } else {
+                if (sb_appendf(&sb,
+                               "set interfaces ethernet %s vlan-id %d "
+                               "mtu %u\n",
+                               iface->name, vlan->vlan_id, vlan->mtu))
+                    goto fail;
+                snprintf(vpfx, sizeof(vpfx),
+                         "set interfaces ethernet %s vlan-id %d",
+                         iface->name, vlan->vlan_id);
+            }
             if (sb_addrs(&sb, vpfx, vlan))
                 goto fail;
         }
@@ -307,10 +320,17 @@ static int show_one_interface(struct sbuf *sb, const struct tr_config *cfg,
     if (iface->kind == TR_IF_ETHERNET &&
         sb_appendf(sb, "  port %d\n", iface->port_id))
         return -1;
-    if (iface->kind == TR_IF_VLAN)
-        if (sb_appendf(sb, "  vlan-id %d parent %s\n", iface->vlan_id,
-                       cfg->ifaces[iface->parent].name))
+    if (iface->kind == TR_IF_VLAN) {
+        int rc = iface->vlan_outer >= 0
+                     ? sb_appendf(sb, "  vlan-s %d vlan-c %d parent %s\n",
+                                  iface->vlan_outer, iface->vlan_id,
+                                  cfg->ifaces[iface->parent].name)
+                     : sb_appendf(sb, "  vlan-id %d parent %s\n",
+                                  iface->vlan_id,
+                                  cfg->ifaces[iface->parent].name);
+        if (rc)
             return -1;
+    }
     for (int i = 0; i < iface->naddrs; i++) {
         tr_prefix_ntop(&iface->addrs[i], a, sizeof(a));
         if (sb_appendf(sb, "  address %s\n", a))

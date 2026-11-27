@@ -150,7 +150,9 @@ IPv4/IPv6 それぞれ 2 分トライで最長一致を行います。connected 
 ```
 rte_eth_rx_burst
   → tr_engine_input(worker, ethernet_slot, mbuf)
-      → VLAN タグあり & eth0.10 が存在: タグを外して VLAN 子を選択
+      → 802.1Q タグ & eth0.10 が存在: タグを外して VLAN 子を選択
+      → 802.1ad + 802.1Q タグ & eth0.100.200 が存在:
+        S/C タグを外して Q-in-Q 子を選択
       → bridge member なら bridge_ingress()
       → それ以外は l3_ingress()
 ```

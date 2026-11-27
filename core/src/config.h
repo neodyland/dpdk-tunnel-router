@@ -37,7 +37,8 @@ struct tr_iface {
     uint32_t mtu;
 
     int port_id;   /* ethernet */
-    int vlan_id;   /* vlan */
+    int vlan_id;   /* vlan C-tag, or single tag */
+    int vlan_outer; /* 802.1ad S-tag, -1 for a single-tagged VLAN */
     int parent;    /* vlan parent slot */
 
     struct tr_prefix addrs[TR_MAX_ADDRS];
@@ -97,6 +98,9 @@ int tr_config_add_ethernet(struct tr_config *cfg, const char *name, int port_id,
 struct tr_iface *tr_config_ensure_vlan(struct tr_config *cfg,
                                        struct tr_iface *parent, int vlan_id,
                                        char *err, size_t errlen);
+struct tr_iface *tr_config_ensure_qinq(struct tr_config *cfg,
+                                       struct tr_iface *parent, int outer,
+                                       int inner, char *err, size_t errlen);
 struct tr_iface *tr_config_ensure_bridge(struct tr_config *cfg,
                                          const char *name, char *err,
                                          size_t errlen);

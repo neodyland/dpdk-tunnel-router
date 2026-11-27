@@ -216,6 +216,40 @@ static struct tr_iface *ensure_dotted_vlan(struct tr_config *cfg,
     return tr_config_ensure_vlan(cfg, parent, (int)vid, err, errlen);
 }
 
+static struct tr_iface *ensure_dotted_qinq(struct tr_config *cfg,
+                                           const char *name, char *err,
+                                           size_t errlen)
+{
+    char parent_name[TR_IFNAME_LEN];
+    const char *d1 = strchr(name, '.');
+    const char *d2 = strrchr(name, '.');
+    uint32_t outer, inner;
+
+    if (!d1 || !d2 || d1 == d2 || d1 == name || !d1[1] || !d2[1])
+        return NULL;
+    if (strchr(d1 + 1, '.') != d2)
+        return NULL;
+    size_t n = (size_t)(d1 - name);
+    if (n >= sizeof(parent_name))
+        return NULL;
+    memcpy(parent_name, name, n);
+    parent_name[n] = '\0';
+    char obuf[16];
+    size_t olen = (size_t)(d2 - d1 - 1);
+    if (olen == 0 || olen >= sizeof(obuf))
+        return NULL;
+    memcpy(obuf, d1 + 1, olen);
+    obuf[olen] = '\0';
+    if (tr_parse_u32(obuf, 1, 4094, &outer) ||
+        tr_parse_u32(d2 + 1, 1, 4094, &inner))
+        return NULL;
+    struct tr_iface *parent = tr_config_find(cfg, parent_name);
+    if (!parent || parent->kind != TR_IF_ETHERNET)
+        return NULL;
+    return tr_config_ensure_qinq(cfg, parent, (int)outer, (int)inner, err,
+                                 errlen);
+}
+
 static int port_from_eth_name(const char *name, int nports, int *port)
 {
     const char *p;
@@ -260,8 +294,11 @@ static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
             if (!iface)
                 return -1;
         } else if (strchr(name, '.') != NULL) {
-            /* `eth0.10` is an alias for vlan-id 10 on eth0. */
-            iface = ensure_dotted_vlan(cfg, name, err, errlen);
+            /* `eth0.10` is a single tag; `eth0.10.20` is Q-in-Q. */
+            if (strchr(name, '.') != strrchr(name, '.'))
+                iface = ensure_dotted_qinq(cfg, name, err, errlen);
+            else
+                iface = ensure_dotted_vlan(cfg, name, err, errlen);
             if (!iface) {
                 if (!err || !err[0])
                     return errf(err, errlen,
@@ -314,6 +351,27 @@ static int set_ethernet(struct tr_config *cfg, const struct tr_config_env *env,
             i++;
         } else if (strcmp(op, "address") == 0) {
             if (add_address(cfg, target, argc, argv, &i, err, errlen))
+                return -1;
+        } else if (strcmp(op, "vlan-s") == 0) {
+            uint32_t outer, inner;
+            if (iface->kind != TR_IF_ETHERNET)
+                return errf(err, errlen,
+                            "vlan-s is only valid on a parent ethernet "
+                            "interface");
+            if (i >= argc)
+                return errf(err, errlen, "vlan-s requires a value");
+            if (tr_parse_u32(argv[i], 1, 4094, &outer))
+                return errf(err, errlen, "vlan-s must be 1..4094");
+            i++;
+            if (i >= argc || strcmp(argv[i], "vlan-c") != 0)
+                return errf(err, errlen, "vlan-s requires 'vlan-c <id>'");
+            i++;
+            if (i >= argc || tr_parse_u32(argv[i], 1, 4094, &inner))
+                return errf(err, errlen, "vlan-c must be 1..4094");
+            i++;
+            target = tr_config_ensure_qinq(cfg, iface, (int)outer,
+                                           (int)inner, err, errlen);
+            if (!target)
                 return -1;
         } else if (strcmp(op, "vlan-id") == 0) {
             uint32_t vid;
@@ -466,6 +524,27 @@ static int delete_iface(struct tr_config *cfg, int argc, char **argv,
         return tr_config_del_iface(cfg, iface, err, errlen);
 
     const char *op = argv[4];
+    if (strcmp(op, "vlan-s") == 0) {
+        uint32_t outer, inner;
+        if (argc < 8)
+            return errf(err, errlen, "vlan-s requires 'vlan-c <id>'");
+        if (tr_parse_u32(argv[5], 1, 4094, &outer) ||
+            strcmp(argv[6], "vlan-c") != 0 ||
+            tr_parse_u32(argv[7], 1, 4094, &inner))
+            return errf(err, errlen, "vlan-s/vlan-c IDs must be 1..4094");
+        char child_name[TR_IFNAME_LEN];
+        snprintf(child_name, sizeof(child_name), "%s.%u.%u", name, outer,
+                 inner);
+        struct tr_iface *child = tr_config_find(cfg, child_name);
+        if (!child)
+            return errf(err, errlen, "Q-in-Q interface '%s' does not exist",
+                        child_name);
+        if (argc == 8)
+            return tr_config_del_iface(cfg, child, err, errlen);
+        if (strcmp(argv[8], "address") == 0)
+            return del_address(child, argc, argv, &(int){9}, err, errlen);
+        return errf(err, errlen, "unknown Q-in-Q delete operation");
+    }
     if (strcmp(op, "vlan-id") == 0) {
         uint32_t vid;
         if (argc < 6)
