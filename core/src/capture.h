@@ -28,6 +28,8 @@ int tr_capture_start(struct tr_capture *cap, int if_slot, const char *ifname,
                      size_t errlen);
 int tr_capture_stop(struct tr_capture *cap, char *err, size_t errlen);
 void tr_capture_poll(struct tr_capture *cap);
+bool tr_capture_is_active(const struct tr_capture *cap);
+
 void tr_capture_tap(struct tr_capture *cap, int if_slot, unsigned direction,
                     const struct rte_mbuf *m);
 /* Capture only when the selected interface is exactly if_slot.  Used for

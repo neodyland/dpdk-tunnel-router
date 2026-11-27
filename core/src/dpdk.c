@@ -203,7 +203,10 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
         fprintf(stderr,
                 "port %u: RSS unsupported by PMD; using 1 RX queue\n", port);
     }
-    conf.rxmode.offloads = 0;
+    if (info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM)
+        conf.rxmode.offloads = RTE_ETH_RX_OFFLOAD_CHECKSUM;
+    else
+        conf.rxmode.offloads = 0;
     if (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) {
         conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
         d->port_tx_ipv4_cksum[port] = true;
@@ -220,6 +223,7 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
         conf.rxmode.mtu = 1500;
         conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
         conf.rx_adv_conf.rss_conf.rss_hf = 0;
+        conf.rxmode.offloads = 0;
         conf.txmode.offloads = 0;
         d->port_tx_ipv4_cksum[port] = false;
         ret = rte_eth_dev_configure(port, nq, nq, &conf);
@@ -243,7 +247,7 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
     }
     memset(&rxq, 0, sizeof(rxq));
     rxq = info.default_rxconf;
-    rxq.offloads = 0;
+    rxq.offloads = conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_CHECKSUM;
     for (uint16_t q = 0; q < nq; q++) {
         if (rte_eth_rx_queue_setup(port, q, rx_desc,
                                    (unsigned int)socket, &rxq, d->mp) != 0) {

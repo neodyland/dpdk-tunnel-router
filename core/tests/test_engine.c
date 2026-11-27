@@ -291,6 +291,80 @@ static int set_mac(struct tr_config *cfg, const char *name, const uint8_t mac[6]
     return 0;
 }
 
+static uint32_t next_rand(uint32_t *state)
+{
+    uint32_t x = *state;
+
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+/* Reference implementation: accumulate one 16-bit big-endian word at a time.
+ * The forwarding path uses a wider (32-bit load) accumulator, so the two must
+ * agree for every length and seed. */
+static uint32_t ref_checksum_add(uint32_t sum, const uint8_t *p, size_t len)
+{
+    while (len >= 2) {
+        sum += (uint32_t)(p[0] << 8 | p[1]);
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        sum += (uint32_t)p[0] << 8;
+    return sum;
+}
+
+static int test_checksum(void)
+{
+    uint32_t seed = 0x12345678u;
+    uint8_t buf[300];
+
+    for (int it = 0; it < 20000; it++) {
+        size_t len = (size_t)(next_rand(&seed) % sizeof(buf));
+        for (size_t i = 0; i < len; i++)
+            buf[i] = (uint8_t)next_rand(&seed);
+        uint32_t iseed = next_rand(&seed);
+        uint16_t want = tr_checksum16_finish(ref_checksum_add(iseed, buf, len));
+        CHECK(tr_checksum16(buf, len, iseed) == want);
+
+        /* Chunked accumulation must match the reference split the same way. */
+        size_t cut = len ? (size_t)(next_rand(&seed) % (len + 1)) : 0;
+        uint32_t a = tr_checksum_add(iseed, buf, cut);
+        a = tr_checksum_add(a, buf + cut, len - cut);
+        uint32_t b = ref_checksum_add(iseed, buf, cut);
+        b = ref_checksum_add(b, buf + cut, len - cut);
+        CHECK(tr_checksum16_finish(a) == tr_checksum16_finish(b));
+    }
+
+    /* Incremental update (RFC 1624) must produce the same header checksum as
+     * a full re-sum for every TTL, protocol and base checksum combination. */
+    for (int it = 0; it < 20000; it++) {
+        uint8_t hdr[20];
+
+        for (int i = 0; i < 20; i++)
+            hdr[i] = (uint8_t)next_rand(&seed);
+        hdr[0] = 0x45;
+        hdr[8] = (uint8_t)(1 + next_rand(&seed) % 254);
+        hdr[10] = 0;
+        hdr[11] = 0;
+        uint16_t full = tr_checksum16(hdr, 20, 0);
+        hdr[10] = (uint8_t)(full >> 8);
+        hdr[11] = (uint8_t)full;
+
+        uint16_t old_word = (uint16_t)((uint16_t)hdr[8] << 8 | hdr[9]);
+        uint16_t new_word = (uint16_t)((uint16_t)(hdr[8] - 1) << 8 | hdr[9]);
+        uint16_t updated = tr_checksum16_update(full, old_word, new_word);
+        hdr[8]--;
+        hdr[10] = (uint8_t)(updated >> 8);
+        hdr[11] = (uint8_t)updated;
+        CHECK(tr_checksum16(hdr, 20, 0) == 0);
+    }
+    return 0;
+}
+
 static int test_arp(struct rte_mempool *mp, struct capture *cap)
 {
     struct tr_config cfg, env_cfg;
@@ -404,6 +478,24 @@ static int test_ipv4_route(struct rte_mempool *mp, struct capture *cap)
     CHECK(p[22] == 63); /* TTL decremented */
     CHECK(memcmp(p + 30, &dst.u.v4, 4) == 0);
     CHECK(ip_checksum(p + 14, 20) == 0);
+
+    /* The forwarding path updates the header checksum incrementally after
+     * decrementing the TTL, so verify the result is a valid checksum for a
+     * range of TTL values and protocols. */
+    for (uint8_t ttl = 2; ttl < 128; ttl++) {
+        uint8_t proto = (ttl & 1) ? 17 : 6;
+        struct rte_mbuf *sm = build_ipv4(mp, eth0_mac, peer_mac, &src, &dst,
+                                         ttl, proto, payload, 8, 7);
+        CHECK(sm != NULL);
+        capture_reset(cap);
+        CHECK(tr_engine_input(e, 0, eth0, sm) == 0);
+        CHECK(cap->n == 1);
+        uint8_t *q = mtod(cap->m[0]);
+        CHECK(q[22] == ttl - 1);
+        CHECK(q[23] == proto);
+        CHECK(ip_checksum(q + 14, 20) == 0);
+        CHECK(memcmp(q + 34, payload, 8) == 0);
+    }
 
     /* With hardware IPv4 checksum offload the header checksum is left zero
      * and the PMD is asked to fill it in. */
@@ -1161,6 +1253,155 @@ static int test_etherip4(struct rte_mempool *mp, struct capture *cap)
 }
 
 
+struct traceroute_arg {
+    struct tr_engine *e;
+    struct rte_mempool *mp;
+    struct capture *cap;
+    const uint8_t *local_mac;
+    const uint8_t *hop_mac;
+    const uint8_t *target_mac;
+    int sent_hop;
+    int sent_target;
+};
+
+static void *traceroute_thread(void *arg)
+{
+    struct traceroute_arg *a = arg;
+    for (int round = 0; round < 400 && !a->sent_target; round++) {
+        for (int i = 0; i < a->cap->n; i++) {
+            struct rte_mbuf *req = a->cap->m[i];
+            uint8_t *q = rte_pktmbuf_mtod(req, uint8_t *);
+            if (rte_pktmbuf_pkt_len(req) < 42 ||
+                (q[12] << 8 | q[13]) != 0x0800)
+                continue;
+            uint8_t *rip = q + 14;
+            if (rip[9] != 1)
+                continue;
+            uint8_t ttl = rip[8];
+            uint8_t *ricmp = rip + 20;
+            if (ttl == 1 && !a->sent_hop) {
+                struct rte_mbuf *m = alloc_frame(a->mp, 14 + 20 + 8 + 28);
+                uint8_t *p = mtod(m);
+                eth_fill(p, a->local_mac, a->hop_mac, 0x0800);
+                uint8_t *ip = p + 14;
+                ip[0] = 0x45;
+                ip[2] = 0;
+                ip[3] = 56;
+                ip[8] = 64;
+                ip[9] = 1;
+                struct in_addr hop, src;
+                inet_pton(AF_INET, "198.51.100.254", &hop);
+                memcpy(&src, rip + 12, 4);
+                memcpy(ip + 12, &hop, 4);
+                memcpy(ip + 16, &src, 4);
+                uint16_t c = ip_checksum(ip, 20);
+                ip[10] = (uint8_t)(c >> 8);
+                ip[11] = (uint8_t)c;
+                uint8_t *icmp = ip + 20;
+                memset(icmp, 0, 36);
+                icmp[0] = 11;
+                memcpy(icmp + 8, rip, 20);
+                memcpy(icmp + 28, ricmp, 8);
+                c = ip_checksum(icmp, 36);
+                icmp[2] = (uint8_t)(c >> 8);
+                icmp[3] = (uint8_t)c;
+                tr_engine_input(a->e, 0, 1, m);
+                a->sent_hop = 1;
+            } else if (ttl == 2 && !a->sent_target) {
+                struct rte_mbuf *m = alloc_frame(a->mp, 14 + 20 + 8 + 32);
+                uint8_t *p = mtod(m);
+                eth_fill(p, a->local_mac, a->target_mac, 0x0800);
+                uint8_t *ip = p + 14;
+                ip[0] = 0x45;
+                ip[2] = 0;
+                ip[3] = 60;
+                ip[8] = 64;
+                ip[9] = 1;
+                struct in_addr target, src;
+                inet_pton(AF_INET, "198.51.100.2", &target);
+                memcpy(&src, rip + 12, 4);
+                memcpy(ip + 12, &target, 4);
+                memcpy(ip + 16, &src, 4);
+                uint16_t c = ip_checksum(ip, 20);
+                ip[10] = (uint8_t)(c >> 8);
+                ip[11] = (uint8_t)c;
+                uint8_t *icmp = ip + 20;
+                memset(icmp, 0, 40);
+                icmp[0] = 0;
+                memcpy(icmp + 4, ricmp + 4, 4);
+                for (int j = 0; j < 32; j++)
+                    icmp[8 + j] = (uint8_t)j;
+                c = ip_checksum(icmp, 40);
+                icmp[2] = (uint8_t)(c >> 8);
+                icmp[3] = (uint8_t)c;
+                tr_engine_input(a->e, 0, 1, m);
+                a->sent_target = 1;
+            }
+        }
+        usleep(5000);
+    }
+    return NULL;
+}
+
+static int test_traceroute(struct rte_mempool *mp, struct capture *cap)
+{
+    struct tr_config cfg, env_cfg;
+    struct tr_config_env env;
+    struct tr_engine *e;
+    char err[256];
+    const uint8_t eth0_mac[6] = {0x02, 0, 0, 0, 0, 1};
+    const uint8_t eth1_mac[6] = {0x02, 0, 0, 0, 0, 2};
+    const uint8_t peer_mac[6] = {0x02, 0, 0, 0, 0, 0xbb};
+    const uint8_t hop_mac[6] = {0x02, 0, 0, 0, 0, 0xcc};
+
+    setup_config(&cfg, &env);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth0 port 0") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0 address 192.0.2.1/24") == 0);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth1 port 1") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth1 address 198.51.100.1/24") == 0);
+    CHECK(set_mac(&cfg, "eth0", eth0_mac) == 0);
+    CHECK(set_mac(&cfg, "eth1", eth1_mac) == 0);
+    e = tr_engine_create(&(struct tr_engine_params){.n_ports = 2,
+                                                    .workers = 1,
+                                                    .mp = mp},
+                         err, sizeof(err));
+    CHECK(e != NULL);
+    tr_engine_set_tx(e, capture_tx, cap);
+    CHECK(tr_engine_apply(e, &cfg, err, sizeof(err)) == 0);
+    tr_engine_config_copy(e, &env_cfg);
+    int eth1 = tr_config_find_const(&env_cfg, "eth1")->slot;
+
+    struct in_addr spa, tpa;
+    inet_pton(AF_INET, "198.51.100.2", &spa);
+    inet_pton(AF_INET, "198.51.100.1", &tpa);
+    struct rte_mbuf *arp =
+        build_arp(mp, eth1_mac, peer_mac, 2, peer_mac, &spa, eth1_mac, &tpa);
+    CHECK(arp != NULL);
+    CHECK(tr_engine_input(e, 0, eth1, arp) == 0);
+    capture_reset(cap);
+
+    struct tr_ip target;
+    CHECK(tr_ip_parse("198.51.100.2", &target) == 0);
+    struct traceroute_arg ta = {
+        .e = e, .mp = mp, .cap = cap, .local_mac = eth1_mac,
+        .hop_mac = hop_mac, .target_mac = peer_mac};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, traceroute_thread, &ta) == 0);
+    char *out = NULL;
+    CHECK(tr_engine_traceroute(e, &target, NULL, NULL, 2, 1, 500, 32,
+                               &out) == 0);
+    pthread_join(th, NULL);
+    CHECK(out != NULL);
+    CHECK(strstr(out, "198.51.100.254") != NULL);
+    CHECK(strstr(out, "Trace complete.") != NULL);
+    free(out);
+    capture_reset(cap);
+    tr_engine_destroy(e);
+    return 0;
+}
+
 struct ping_reply_arg {
     struct tr_engine *e;
     struct rte_mempool *mp;
@@ -1351,6 +1592,7 @@ int main(void)
     }
     struct capture cap = {0};
     int rc = 0;
+    rc |= test_checksum();
     rc |= test_arp(mp, &cap);
     rc |= test_ipv4_route(mp, &cap);
     rc |= test_ndp(mp, &cap);
@@ -1360,6 +1602,7 @@ int main(void)
     rc |= test_bridge(mp, &cap);
     rc |= test_autoconf(mp, &cap);
     rc |= test_ping(mp, &cap);
+    rc |= test_traceroute(mp, &cap);
     rc |= test_etherip4(mp, &cap);
     rc |= test_malformed(mp, &cap);
     capture_reset(&cap);

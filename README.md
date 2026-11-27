@@ -45,7 +45,7 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
 | ブリッジ | MAC 学習、フラッディング、エージング。VLAN 子インタフェースやトンネルをメンバーにできる |
 | 静的ルート | IPv4/IPv6 の最長一致FIB。再帰的な next-hop 解決に対応 |
 | 並列処理 | DPDK RSS + マルチキュー + ワーカー lcore。パケット処理はロックなし、設定は reader gate 付きの不変スナップショット差し替え |
-| Ping | `ping <IPv4/IPv6>` でデータプレーン経由の ICMP echo。FIB / ARP / NDP / VLAN を使用 |
+| Ping / traceroute | データプレーン経由の ICMP echo / TTL 増加による経路探索。FIB / ARP / NDP / VLAN を使用 |
 | デバッグキャプチャ | `tcpdump start/stop/status` で pcap を取得。物理 RX/TX、トンネル内側 RX/TX、簡易フィルタ、count/snaplen 対応 |
 | 永続化 | 正常に適用された設定だけをコアが原子的に保存。クライアントは設定ファイルを書かない |
 
@@ -355,7 +355,41 @@ MAC table (bridge forwarding):
 bridge br0  mac aa:bb:cc:dd:ee:ff  port eth0  age 120ms
 ```
 
-### 5.5 設定コマンド
+### 5.5 traceroute
+
+TTL / Hop Limit を増やしながら ICMP echo request を送り、途中の
+ICMP Time Exceeded と宛先の Echo Reply からホップを表示します。
+
+```sh
+./scripts/routerctl traceroute 192.0.2.1
+./scripts/routerctl traceroute 2001:db8::1 max-hops 20 probes 2
+./scripts/routerctl traceroute 198.51.100.2 interface eth1
+```
+
+```text
+traceroute <IPv4|IPv6> [max-hops N] [probes N] [timeout MS] [size BYTES]
+           [source ADDR] [interface IF]
+
+max-hops  1..64 (default 30)
+probes    1..5 per hop (default 3)
+timeout   100..10000 ms per probe (default 1000)
+size      8..1400 ICMP payload bytes (default 32)
+source    local source address
+interface Ethernet/VLAN egress
+```
+
+出力例:
+
+```text
+traceroute to 198.51.100.2, 30 hops max, 32 byte packets
+ 1  192.0.2.254                            0.421 ms  0.398 ms  0.412 ms
+ 2  198.51.100.2                           1.203 ms  1.188 ms  1.201 ms
+Trace complete.
+```
+
+TTL 応答がないホップは `*` と表示されます。
+
+### 5.6 設定コマンド
 
 ```text
 set interfaces tunnel <Tunnel name> remote <IPv4 / IPv6>
@@ -439,7 +473,7 @@ save 失敗時は running を維持したままエラーを返します。
 ワンショットの `set` / `delete` と `--file` は、commit と save までを自動で
 1 トランザクションとして実行します。
 
-### 5.6 コンテキストヘルプ
+### 5.7 コンテキストヘルプ
 
 `?` をコマンドの末尾に付けると、その位置で使える構文・現在値・例を表示します。
 
@@ -454,6 +488,7 @@ router> set protocols static route ?
 router> show ?
 router> tcpdump ?
 router> ping ?
+router> traceroute ?
 ```
 
 `help <path>` でも同じ内容を表示できます。
@@ -563,12 +598,30 @@ C の組み込みドライバーは `struct tr_tnl_driver` の vtable、Rust は
   per-worker reader flag と writer gate で runtime を差し替え
 - VLAN は親スロット + VLAN ID のハッシュで子スロットを直接取得（名前検索なし）
 - トンネルは outer remote アドレスのハッシュで候補を絞り込み
+- ローカルアドレス判定は、アドレス数が 2 以下なら線形走査、それ以上は
+  `(if_slot, address)` ハッシュで O(1)。キャッシュ用のハッシュは FNV ではなく
+  1 回の乗算（IPv6 は 4 語）で計算します
+- データプレーンの時刻とキャプチャ有効判定は RX バースト先頭で 1 回だけ取得し、
+  バースト内の全パケットで共有（近隣の aging / 要求間隔 / 再組み立てタイムアウト /
+  MAC aging はいずれもミリ秒精度なので挙動は変わりません）
+- 16 bit checksum は 32 bit ロード + byte swap で 4 バイトずつ畳み込み。
+  IPv4 ヘッダ（20 byte）で約 3 割、フルサイズセグメントで数倍高速
+- 転送時の IPv4 ヘッダ checksum は、TTL の減算で変化した 16 bit 語だけを
+  RFC 1624 の式で差分更新（ヘッダ全体の再計算をしない）
+- checksum のプリミティブ、`tr_ip_equal()`、`tr_mac_is_multicast()` は
+  ヘッダの `static inline` に置き、呼び出し側で定数長のループを展開
+- VLAN タグの判定は 1 パケット 1 回だけ行い、結果を下位の処理へ渡す
 - CPU ごとの経路キャッシュ（1024 entries）と近隣キャッシュ（512 entries、
   2 秒 TTL）で FIB トライ / ARP・NDP テーブルのロックを省略
 - TX はワーカーごと・ポートごとに最大 32 パケットをバッチし、
   `rte_eth_tx_burst()` を 1 回で発行
+- TX 統計はバースト単位で集約し、パケットごとの atomic 加算を削減
+- キャプチャ停止中は RX バーストごとの active 判定だけを行い、
+  パケットごとの tap 呼び出しを省略
 - RX バースト内で次の mbuf をプリフェッチ
 - コアの C コンパイルを `-O3`（DPDK の `-march=native` と併用）
+- PMD が対応している場合は RX checksum offload を有効化し、
+  IPv4 header checksum のソフトウェア検証を省略
 - 全ポートが対応している場合のみ IPv4 TX checksum offload を有効化
 - バインド済みポートだけをポーリングする active port リストと、
   アイドル時の adaptive polling（busy poll → sleep）
@@ -588,11 +641,32 @@ C の組み込みドライバーは `struct tr_tnl_driver` の vtable、Rust は
 make bench
 ```
 
-1 ワーカー、ARP 解決済みの IPv4 フォワーディングを 200 万パケット処理する
-合成ベンチです。NIC 性能ではなく、エンジンと reader gate/キャッシュ/TX バッチの
-効果を確認するためのものです。手元の環境では、最適化前の約 3.0 Mpps から
-burst API で約 4.9 Mpps 程度まで改善しました（`taskset` で 1 コア固定、
-環境により変動）。single API は実行ごとの変動が大きく、約 3〜4 Mpps でした。
+1 ワーカー、ARP 解決済みの IPv4 フォワーディングを合成パケットで処理する
+ベンチです。NIC 性能ではなく、エンジン本体のコストを確認するためのものです。
+
+- `single`: 1 パケットずつ `tr_engine_input()` を呼ぶ（パケット生成込み）
+- `burst`: 32 パケットずつ `tr_engine_input_burst()` を呼ぶ
+  （ワーカーループと同じ形。パケット生成込み）
+
+各モードを 5 ラウンド交互に実行し、最良ラウンドを表示します。共有・仮想化
+環境ではコア周波数が数十 % 変動し wall-clock の Mpps が比較に使えないため、
+不変 TSC で計測した `cyc/pkt`（1 パケットあたりの TSC サイクル）を主指標に
+しています。ビルド間の比較はこの値で行ってください。
+
+同じホスト・同じベンチ・変更前後を交互に実行した比較（1 コア、DPDK 24.11、
+gcc 13.3、Xeon E5-2690 v4 / KVM、各 5 回の最良値）:
+
+| 指標 | 変更前 | 変更後 | 差分 |
+| --- | --- | --- | --- |
+| burst `cyc/pkt`（最良） | 433 | 274 | -37% |
+| burst `cyc/pkt`（中央値） | 444 | 299 | -33% |
+| burst スループット（最良ラウンド） | 6.0 Mpps | 9.5 Mpps | +58% |
+| single `cyc/pkt`（最良） | 487 | 422 | -13% |
+
+A/B を 4 回繰り返し、burst は **-33% 〜 -41%** の範囲で再現しました。
+single は 1 パケットごとに時刻を取得する 1 パケット API の性質上、改善幅が
+小さくなります（本番のワーカーループは burst API を使います）。Mpps は
+同じ実行の最良ラウンドの値で、ホストの周波数依存があります。
 
 ## 9. テスト
 
@@ -606,6 +680,8 @@ make test
 - `test_engine`: ARP、NDP、IPv4 転送、VLAN、ブリッジ、RA/SLAAC、
   データプレーン ping、MAC テーブル表示、9000 byte オーバーレイを 1500 byte
   アンダーレイへ分割して再組み立て、TCP MSS clamping とチェックサム。
+  checksum 演算は参照実装との一致（長さ・チャンク分割をランダム化）と、
+  TTL 減算時の差分更新が全 TTL で有効な checksum になることを検証します。
 - `test_capture`: pcap ヘッダ、count 自動停止、ARP フィルタ、pcap レコード。
 - Rust: EtherIP4/6 ラウンドトリップ、C ABI のレイアウトと FFI 呼び出し。
 - `scripts/smoke-test.sh`: `net_null` で実プロセスを起動し、`routerctl` の

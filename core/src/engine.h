@@ -48,6 +48,12 @@ int tr_engine_ping(struct tr_engine *e, const struct tr_ip *target,
                    int count, int timeout_ms, size_t payload_len,
                    char **out);
 
+/* ICMP-based traceroute through the data plane. */
+int tr_engine_traceroute(struct tr_engine *e, const struct tr_ip *target,
+                         const char *interface, const struct tr_ip *source,
+                         int max_hops, int probes, int timeout_ms,
+                         size_t payload_len, char **out);
+
 int tr_engine_apply(struct tr_engine *e, const struct tr_config *cfg,
                     char *err, size_t errlen);
 void tr_engine_config_env(struct tr_engine *e, struct tr_config_env *env);

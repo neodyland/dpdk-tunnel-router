@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 enum tr_family {
     TR_AF_NONE = 0,
@@ -32,7 +33,20 @@ int tr_ip_parse_family(const char *s, uint8_t family, struct tr_ip *out);
 int tr_ip_ntop(const struct tr_ip *ip, char *buf, size_t len);
 int tr_prefix_ntop(const struct tr_prefix *p, char *buf, size_t len);
 
-bool tr_ip_equal(const struct tr_ip *a, const struct tr_ip *b);
+static inline bool tr_ip_equal(const struct tr_ip *a, const struct tr_ip *b)
+{
+    if (!a || !b || a->family != b->family)
+        return false;
+    switch (a->family) {
+    case TR_AF_INET:
+        return a->u.v4.s_addr == b->u.v4.s_addr;
+    case TR_AF_INET6:
+        return memcmp(&a->u.v6, &b->u.v6, sizeof(a->u.v6)) == 0;
+    default:
+        return true;
+    }
+}
+
 bool tr_ip_is_unspecified(const struct tr_ip *a);
 bool tr_ip_is_multicast(const struct tr_ip *a);
 bool tr_ip_is_linklocal(const struct tr_ip *a);

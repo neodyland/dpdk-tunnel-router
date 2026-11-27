@@ -168,6 +168,9 @@ ctl show interfaces | grep -q '203.0.113.1/24' || {
 # Data-plane ping and the enhanced neighbor/MAC table.
 ping_out=$(ctl ping 203.0.113.254 count 1 timeout 100)
 expect_contains "$ping_out" "packets transmitted" "ping statistics"
+trace_out=$(ctl traceroute 203.0.113.254 max-hops 1 probes 1 timeout 100)
+expect_contains "$trace_out" "traceroute to" "traceroute output"
+expect_contains "$trace_out" "Trace stopped at max hops." "traceroute max hops"
 neigh_out=$(ctl show neighbors)
 expect_contains "$neigh_out" "MAC table (bridge forwarding)" "MAC table"
 

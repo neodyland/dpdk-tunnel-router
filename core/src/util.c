@@ -37,32 +37,6 @@ uint64_t tr_monotonic_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-uint32_t tr_checksum_add(uint32_t sum, const void *data, size_t len)
-{
-    const uint8_t *p = data;
-
-    while (len >= 2) {
-        sum += (uint32_t)p[0] << 8 | p[1];
-        p += 2;
-        len -= 2;
-    }
-    if (len)
-        sum += (uint32_t)p[0] << 8;
-    return sum;
-}
-
-uint16_t tr_checksum16_finish(uint32_t sum)
-{
-    while (sum >> 16)
-        sum = (sum & 0xffffu) + (sum >> 16);
-    return (uint16_t)~sum;
-}
-
-uint16_t tr_checksum16(const void *data, size_t len, uint32_t seed)
-{
-    return tr_checksum16_finish(tr_checksum_add(seed, data, len));
-}
-
 uint64_t tr_random_u64(void)
 {
     static _Atomic uint64_t state = 0;
@@ -164,11 +138,6 @@ void tr_mac_from_name(const char *name, uint8_t mac[6])
     mac[4] = (uint8_t)h;
     uint32_t h2 = h * 2654435761u;
     mac[5] = (uint8_t)(h2 >> 24);
-}
-
-bool tr_mac_is_multicast(const uint8_t mac[6])
-{
-    return (mac[0] & 0x01) != 0;
 }
 
 bool tr_mac_is_broadcast(const uint8_t mac[6])

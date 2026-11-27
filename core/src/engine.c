@@ -46,6 +46,8 @@
 #define ICMPV6_NEIGH_ADVERT 136
 
 #define TR_LOCAL_MAX 512
+#define TR_LOCAL_MAP_SIZE 1024
+#define TR_STATS_WORDS ((TR_MAX_IFACES + 63) / 64)
 #define TR_DYN_ADDR_MAX 64
 #define TR_DYN_ROUTE_MAX 64
 #define TR_RA_QUEUE 64
@@ -53,6 +55,8 @@
 #define TR_NEIGH_CACHE_SIZE 512
 #define TR_NEIGH_CACHE_TTL_MS 2000
 #define TR_PING_MAX 64
+#define TR_TRACE_MAX_HOPS 64
+#define TR_TRACE_MAX_PROBES 5
 
 struct tr_ping_state {
     pthread_mutex_t lock;
@@ -65,6 +69,21 @@ struct tr_ping_state {
     uint64_t rtt_ns;
     struct tr_ip target;
     struct tr_ip source;
+};
+
+struct tr_trace_state {
+    pthread_mutex_t lock;
+    _Atomic bool active;
+    uint16_t id;
+    uint16_t seq;
+    uint8_t reply_kind; /* 1 = time exceeded, 2 = echo reply */
+    uint8_t ttl;
+    bool replied;
+    uint64_t sent_ns;
+    uint64_t rtt_ns;
+    struct tr_ip target;
+    struct tr_ip source;
+    struct tr_ip responder;
 };
 
 struct tr_rt_cache_entry {
@@ -100,6 +119,12 @@ struct tr_local_addr {
     int if_slot;
     bool linklocal;
     bool dynamic;
+};
+
+struct tr_local_map_entry {
+    struct tr_ip ip;
+    int if_slot;
+    bool used;
 };
 
 struct tr_dyn_addr {
@@ -142,6 +167,7 @@ struct tr_runtime {
     struct tr_fib fib;
     struct tr_tunnel_rt tunnel[TR_MAX_IFACES];
     struct tr_local_addr locals[TR_LOCAL_MAX];
+    struct tr_local_map_entry local_map[TR_LOCAL_MAP_SIZE];
     int nlocals;
     struct tr_vlan_map_entry vlan_map[TR_VLAN_MAP_SIZE];
     int tunnel_head[TR_TUNNEL_HASH_SIZE];
@@ -169,9 +195,19 @@ struct tr_engine {
     struct tr_reasm reasm[TR_MAX_WORKERS];
 
     struct tr_if_stats stats[TR_MAX_IFACES][TR_MAX_WORKERS];
+    uint64_t tx_pending_pkts[TR_MAX_WORKERS][TR_MAX_IFACES];
+    uint64_t tx_pending_bytes[TR_MAX_WORKERS][TR_MAX_IFACES];
+    uint64_t tx_dirty[TR_MAX_WORKERS][TR_STATS_WORDS];
     struct tr_rt_cache_entry rt_cache[TR_MAX_WORKERS][TR_RT_CACHE_SIZE];
     struct tr_neigh_cache_entry
         neigh_cache[TR_MAX_WORKERS][TR_NEIGH_CACHE_SIZE];
+
+    /* Per-worker snapshots taken once per RX burst.  Neighbour aging,
+     * reassembly timeouts, bridge aging and capture filtering all only need
+     * millisecond resolution, so one clock read and one capture-flag read per
+     * burst replace one of each per packet. */
+    uint64_t now_ms[TR_MAX_WORKERS];
+    bool capture_on[TR_MAX_WORKERS];
 
     struct tr_dyn_addr dyn_addr[TR_DYN_ADDR_MAX];
     struct tr_dyn_route dyn_route[TR_DYN_ROUTE_MAX];
@@ -184,12 +220,41 @@ struct tr_engine {
     bool rs_sent;
     uint16_t ping_id;
     struct tr_ping_state ping;
+    uint16_t trace_id;
+    struct tr_trace_state trace;
 };
 
 static void free_mbuf_cb(void *pkt)
 {
     if (pkt)
         rte_pktmbuf_free((struct rte_mbuf *)pkt);
+}
+
+/* Data-plane time and capture state are snapshotted once per RX burst (see
+ * tr_engine_input_burst()).  A burst is a few microseconds of work, so every
+ * consumer of these values -- neighbour aging, neighbour request rate
+ * limiting, reassembly timeouts, bridge aging, capture filtering -- observes
+ * the same value as before with millisecond resolution.
+ *
+ * Callers outside the worker range (control-plane transmissions) get a live
+ * reading instead, so ping/traceroute and route solicitation keep their
+ * existing timing behaviour. */
+static inline uint64_t pkt_now(const struct tr_engine *e, int worker)
+{
+    if (worker >= 0 && worker < e->workers)
+        return e->now_ms[worker];
+    return tr_monotonic_ms();
+}
+
+/* Capture enable state is likewise sampled per burst, so starting or stopping
+ * a capture takes effect at the next burst boundary (at most one RX burst of
+ * packets, i.e. a few microseconds).  The packet filter itself is still
+ * evaluated per packet inside the capture code. */
+static inline bool pkt_capture_on(const struct tr_engine *e, int worker)
+{
+    if (worker >= 0 && worker < e->workers)
+        return e->capture_on[worker];
+    return tr_capture_is_active(e->capture);
 }
 
 static struct tr_iface *rt_iface(struct tr_runtime *rt, int slot)
@@ -244,12 +309,53 @@ static void stats_rx_bulk(struct tr_engine *e, int worker, int if_slot,
 static void stats_tx(struct tr_engine *e, int worker, int if_slot,
                      uint32_t len)
 {
-    if (if_slot >= 0 && if_slot < TR_MAX_IFACES && worker >= 0 &&
-        worker < TR_MAX_WORKERS) {
+    if (if_slot < 0 || if_slot >= TR_MAX_IFACES)
+        return;
+    if (worker >= 0 && worker < e->workers) {
+        e->tx_pending_pkts[worker][if_slot]++;
+        e->tx_pending_bytes[worker][if_slot] += len;
+        e->tx_dirty[worker][if_slot / 64] |=
+            1ull << (if_slot % 64);
+        return;
+    }
+    if (worker >= 0 && worker < TR_MAX_WORKERS) {
         atomic_fetch_add_explicit(&e->stats[if_slot][worker].tx_pkts, 1,
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&e->stats[if_slot][worker].tx_bytes, len,
                                   memory_order_relaxed);
+    } else {
+        /* Control-plane transmission (ping/RS). */
+        atomic_fetch_add_explicit(&e->stats[if_slot][0].tx_pkts, 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&e->stats[if_slot][0].tx_bytes, len,
+                                  memory_order_relaxed);
+    }
+}
+
+static void stats_tx_flush(struct tr_engine *e, int worker)
+{
+    if (worker < 0 || worker >= e->workers)
+        return;
+    for (int w = 0; w < TR_STATS_WORDS; w++) {
+        uint64_t bits = e->tx_dirty[worker][w];
+        e->tx_dirty[worker][w] = 0;
+        while (bits) {
+            int bit = __builtin_ctzll(bits);
+            int slot = w * 64 + bit;
+            bits &= bits - 1;
+            if (slot >= TR_MAX_IFACES)
+                continue;
+            uint64_t pkts = e->tx_pending_pkts[worker][slot];
+            uint64_t bytes = e->tx_pending_bytes[worker][slot];
+            e->tx_pending_pkts[worker][slot] = 0;
+            e->tx_pending_bytes[worker][slot] = 0;
+            if (pkts) {
+                atomic_fetch_add_explicit(&e->stats[slot][worker].tx_pkts,
+                                          pkts, memory_order_relaxed);
+                atomic_fetch_add_explicit(&e->stats[slot][worker].tx_bytes,
+                                          bytes, memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -288,21 +394,71 @@ static void runtime_free(struct tr_runtime *rt)
     free(rt);
 }
 
+/* Address hash used by the per-worker forwarding caches.  It is deliberately
+ * cheaper than tr_ip_hash() (one multiply for IPv4, four for IPv6) because it
+ * runs once or twice per packet; the neighbour table keeps its own hash. */
+static inline unsigned addr_hash_slot(const struct tr_ip *ip, int slot)
+{
+    if (ip->family == TR_AF_INET) {
+        uint32_t x = ntohl(ip->u.v4.s_addr) ^
+                     ((uint32_t)slot * 2654435761u);
+        x *= 2654435761u;
+        return (unsigned)(x ^ (x >> 16));
+    }
+    uint32_t w[4];
+    uint32_t h = 2166136261u ^ ((uint32_t)slot * 2654435761u);
+
+    memcpy(w, ip->u.v6.s6_addr, sizeof(w));
+    for (int i = 0; i < 4; i++) {
+        h ^= w[i];
+        h *= 16777619u;
+    }
+    return (unsigned)(h ^ (h >> 16));
+}
+
+static unsigned local_map_hash(const struct tr_ip *ip, int if_slot)
+{
+    return addr_hash_slot(ip, if_slot) & (TR_LOCAL_MAP_SIZE - 1);
+}
+
+static struct tr_local_map_entry *local_map_find(struct tr_runtime *rt,
+                                                 const struct tr_ip *ip,
+                                                 int if_slot)
+{
+    unsigned h = local_map_hash(ip, if_slot);
+    for (int probe = 0; probe < TR_LOCAL_MAP_SIZE; probe++) {
+        struct tr_local_map_entry *e =
+            &rt->local_map[(h + (unsigned)probe) & (TR_LOCAL_MAP_SIZE - 1)];
+        if (!e->used)
+            return NULL;
+        if (e->if_slot == if_slot && tr_ip_equal(&e->ip, ip))
+            return e;
+    }
+    return NULL;
+}
+
 static void local_add(struct tr_runtime *rt, const struct tr_ip *ip,
                       int if_slot, bool linklocal, bool dynamic)
 {
-    if (rt->nlocals >= TR_LOCAL_MAX)
+    if (rt->nlocals >= TR_LOCAL_MAX || local_map_find(rt, ip, if_slot))
         return;
-    for (int i = 0; i < rt->nlocals; i++) {
-        if (rt->locals[i].if_slot == if_slot &&
-            tr_ip_equal(&rt->locals[i].ip, ip))
-            return;
-    }
     rt->locals[rt->nlocals].ip = *ip;
     rt->locals[rt->nlocals].if_slot = if_slot;
     rt->locals[rt->nlocals].linklocal = linklocal;
     rt->locals[rt->nlocals].dynamic = dynamic;
     rt->nlocals++;
+
+    unsigned h = local_map_hash(ip, if_slot);
+    for (int probe = 0; probe < TR_LOCAL_MAP_SIZE; probe++) {
+        struct tr_local_map_entry *e =
+            &rt->local_map[(h + (unsigned)probe) & (TR_LOCAL_MAP_SIZE - 1)];
+        if (!e->used) {
+            e->used = true;
+            e->ip = *ip;
+            e->if_slot = if_slot;
+            break;
+        }
+    }
 }
 
 static int runtime_build(struct tr_engine *e, const struct tr_config *cfg,
@@ -482,9 +638,14 @@ struct tr_engine *tr_engine_create(const struct tr_engine_params *params,
     e->n_ports = params->n_ports;
     e->workers = params->workers;
     e->mp = params->mp;
+    for (int i = 0; i < TR_MAX_WORKERS; i++) {
+        e->now_ms[i] = tr_monotonic_ms();
+        e->capture_on[i] = false;
+    }
     pthread_rwlock_init(&e->rt_lock, NULL);
     pthread_mutex_init(&e->ra_lock, NULL);
     pthread_mutex_init(&e->ping.lock, NULL);
+    pthread_mutex_init(&e->trace.lock, NULL);
     tr_neigh_init(&e->neigh4, free_mbuf_cb);
     tr_neigh_init(&e->neigh6, free_mbuf_cb);
     tr_bridge_db_init(&e->bridges);
@@ -518,6 +679,7 @@ void tr_engine_destroy(struct tr_engine *e)
     tr_bridge_db_fini(&e->bridges);
     for (int i = 0; i < TR_MAX_WORKERS; i++)
         tr_reasm_fini(&e->reasm[i]);
+    pthread_mutex_destroy(&e->trace.lock);
     pthread_mutex_destroy(&e->ping.lock);
     pthread_mutex_destroy(&e->ra_lock);
     pthread_rwlock_destroy(&e->rt_lock);
@@ -661,9 +823,23 @@ static const struct tr_iface *iface_by_slot_rt(const struct tr_runtime *rt,
 static bool is_local_if(const struct tr_runtime *rt, int if_slot,
                         const struct tr_ip *ip)
 {
-    for (int i = 0; i < rt->nlocals; i++) {
-        if (rt->locals[i].if_slot == if_slot &&
-            tr_ip_equal(&rt->locals[i].ip, ip))
+    /* Small tables are cheaper to scan than to hash; anything larger uses the
+     * open-addressed map built by local_add(). */
+    if (rt->nlocals <= 2) {
+        for (int i = 0; i < rt->nlocals; i++) {
+            if (rt->locals[i].if_slot == if_slot &&
+                tr_ip_equal(&rt->locals[i].ip, ip))
+                return true;
+        }
+        return false;
+    }
+    unsigned h = local_map_hash(ip, if_slot);
+    for (int probe = 0; probe < TR_LOCAL_MAP_SIZE; probe++) {
+        const struct tr_local_map_entry *e =
+            &rt->local_map[(h + (unsigned)probe) & (TR_LOCAL_MAP_SIZE - 1)];
+        if (!e->used)
+            return false;
+        if (e->if_slot == if_slot && tr_ip_equal(&e->ip, ip))
             return true;
     }
     return false;
@@ -771,7 +947,7 @@ static int neigh_lookup_cached(struct tr_engine *e, int worker,
 {
     struct tr_neigh_table *t =
         ip->family == TR_AF_INET ? &e->neigh4 : &e->neigh6;
-    unsigned h = tr_ip_hash(ip) ^ ((unsigned)if_slot * 2654435761u);
+    unsigned h = addr_hash_slot(ip, if_slot);
     struct tr_neigh_cache_entry *c =
         &e->neigh_cache[worker][h & (TR_NEIGH_CACHE_SIZE - 1)];
 
@@ -814,9 +990,10 @@ static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
             rte_pktmbuf_free(m);
         return;
     }
-    bool will_tag = iface->kind == TR_IF_VLAN && !pkt_tagged(m);
+    bool tagged = pkt_tagged(m);
+    bool will_tag = iface->kind == TR_IF_VLAN && !tagged;
     uint32_t final_len = mlen(m) + (will_tag ? 4 : 0);
-    maxlen = iface->mtu + ETH_HLEN + ((pkt_tagged(m) || will_tag) ? 4 : 0);
+    maxlen = iface->mtu + ETH_HLEN + ((tagged || will_tag) ? 4 : 0);
     if (final_len > maxlen) {
         stats_drop(e, worker, if_slot);
         rte_pktmbuf_free(m);
@@ -827,17 +1004,20 @@ static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
         rte_pktmbuf_free(m);
         return;
     }
+    bool capture = pkt_capture_on(e, worker);
     if (iface->kind == TR_IF_VLAN) {
         /* Logical VLAN tap: untagged inner frame, like tcpdump on eth0.10. */
-        tr_capture_tap_exact(e->capture, if_slot, TR_CAP_TX, m);
+        if (capture)
+            tr_capture_tap_exact(e->capture, if_slot, TR_CAP_TX, m);
         if (will_tag && pkt_add_vlan(m, (uint16_t)iface->vlan_id)) {
             stats_drop(e, worker, if_slot);
             rte_pktmbuf_free(m);
             return;
         }
         /* Physical parent tap: tagged frame on the wire. */
-        tr_capture_tap(e->capture, iface->parent, TR_CAP_TX, m);
-    } else {
+        if (capture)
+            tr_capture_tap(e->capture, iface->parent, TR_CAP_TX, m);
+    } else if (capture) {
         tr_capture_tap(e->capture, if_slot, TR_CAP_TX, m);
     }
     stats_tx(e, worker, if_slot, mlen(m));
@@ -1210,7 +1390,7 @@ static void flush_pending_family(struct tr_engine *e, int worker,
     struct tr_neigh_table *t =
         family == TR_AF_INET ? &e->neigh4 : &e->neigh6;
 
-    if (tr_neigh_learn(t, if_slot, ip, mac, tr_monotonic_ms(), pending,
+    if (tr_neigh_learn(t, if_slot, ip, mac, pkt_now(e, worker), pending,
                        TR_NEIGH_PENDING, &n))
         return;
     for (int i = 0; i < n; i++) {
@@ -1243,7 +1423,7 @@ static void resolve_and_send(struct tr_engine *e, int worker,
     uint8_t mac[6];
     uint8_t state = 0;
     struct tr_neigh_table *t;
-    uint64_t now = tr_monotonic_ms();
+    uint64_t now = pkt_now(e, worker);
 
     if (!m || (next_hop->family != TR_AF_INET &&
                next_hop->family != TR_AF_INET6)) {
@@ -1843,6 +2023,26 @@ static void handle_ra(struct tr_engine *e, int worker, struct tr_runtime *rt,
     }
 }
 
+static void trace_note_reply(struct tr_engine *e, const struct tr_ip *src,
+                            const struct tr_ip *dst, uint8_t kind,
+                            uint8_t ttl, uint16_t id, uint16_t seq)
+{
+    if (!atomic_load_explicit(&e->trace.active, memory_order_relaxed))
+        return;
+    uint64_t now = tr_monotonic_ns();
+    pthread_mutex_lock(&e->trace.lock);
+    if (e->trace.active && id == e->trace.id && seq == e->trace.seq &&
+        !e->trace.replied && tr_ip_equal(dst, &e->trace.source) &&
+        (kind == 1 || tr_ip_equal(src, &e->trace.target))) {
+        e->trace.replied = true;
+        e->trace.reply_kind = kind;
+        e->trace.ttl = ttl;
+        e->trace.responder = *src;
+        e->trace.rtt_ns = now - e->trace.sent_ns;
+    }
+    pthread_mutex_unlock(&e->trace.lock);
+}
+
 static void ping_note_reply(struct tr_engine *e, const struct tr_ip *src,
                             const struct tr_ip *dst, const uint8_t *icmp,
                             uint8_t ttl);
@@ -1915,8 +2115,26 @@ static void handle_icmp6(struct tr_engine *e, int worker,
         rte_pktmbuf_free(m);
         return;
     }
+    if (icmp_type == 3 && icmp_len >= 8 + 40 + 8) {
+        const uint8_t *emb = icmp + 8;
+        const uint8_t *ei = emb + 40;
+        if (ei[0] == ICMPV6_ECHO_REQUEST) {
+            struct tr_ip esrc = {.family = TR_AF_INET6};
+            struct tr_ip edst = {.family = TR_AF_INET6};
+            memcpy(&esrc.u.v6, ip + 8, 16);
+            memcpy(&edst.u.v6, ip + 24, 16);
+            trace_note_reply(e, &esrc, &edst, 1, ip[7],
+                             (uint16_t)(ei[4] << 8 | ei[5]),
+                             (uint16_t)(ei[6] << 8 | ei[7]));
+            rte_pktmbuf_free(m);
+            return;
+        }
+    }
     if (icmp_type == ICMPV6_ECHO_REPLY) {
+        uint16_t id = (uint16_t)(icmp[4] << 8 | icmp[5]);
+        uint16_t seq = (uint16_t)(icmp[6] << 8 | icmp[7]);
         ping_note_reply(e, &src, &dst, icmp, ip[7]);
+        trace_note_reply(e, &src, &dst, 2, ip[7], id, seq);
         rte_pktmbuf_free(m);
         return;
     }
@@ -1959,12 +2177,32 @@ static void handle_icmp4(struct tr_engine *e, int worker,
     uint8_t *icmp = mtod(m) + l3off + 20;
     if (mlen(m) < l3off + 20 + 8)
         goto drop;
+    if (icmp[0] == 11 && mlen(m) >= l3off + 20 + 8 + 20 + 8) {
+        const uint8_t *emb = icmp + 8;
+        uint32_t eihl = (uint32_t)(emb[0] & 0x0f) * 4;
+        if (eihl >= 20 && mlen(m) >= l3off + 20 + 8 + eihl + 8 &&
+            emb[eihl] == ICMP_ECHO) {
+            const uint8_t *ei = emb + eihl;
+            struct tr_ip esrc = {.family = TR_AF_INET};
+            struct tr_ip edst = {.family = TR_AF_INET};
+            memcpy(&esrc.u.v4, ip + 12, 4);
+            memcpy(&edst.u.v4, ip + 16, 4);
+            trace_note_reply(e, &esrc, &edst, 1, ip[8],
+                             (uint16_t)(ei[4] << 8 | ei[5]),
+                             (uint16_t)(ei[6] << 8 | ei[7]));
+            rte_pktmbuf_free(m);
+            return;
+        }
+    }
     if (icmp[0] == ICMP_ECHO_REPLY) {
         struct tr_ip src = {.family = TR_AF_INET};
         struct tr_ip dst = {.family = TR_AF_INET};
         memcpy(&src.u.v4, ip + 12, 4);
         memcpy(&dst.u.v4, ip + 16, 4);
+        uint16_t id = (uint16_t)(icmp[4] << 8 | icmp[5]);
+        uint16_t seq = (uint16_t)(icmp[6] << 8 | icmp[7]);
         ping_note_reply(e, &src, &dst, icmp, ip[8]);
+        trace_note_reply(e, &src, &dst, 2, ip[8], id, seq);
         rte_pktmbuf_free(m);
         return;
     }
@@ -2060,14 +2298,20 @@ static void l3_forward4(struct tr_engine *e, int worker,
     p[8] = (uint8_t)(ttl - 1);
     bool hw_cksum = e->tx_ipv4_cksum &&
                     egress->kind != TR_IF_TUNNEL;
-    p[10] = 0;
-    p[11] = 0;
     if (hw_cksum) {
+        p[10] = 0;
+        p[11] = 0;
         m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
         m->l2_len = egress->kind == TR_IF_VLAN ? 18 : 14;
         m->l3_len = (uint16_t)((p[0] & 0x0f) * 4);
     } else {
-        uint16_t csum = tr_checksum16(p, (uint32_t)(p[0] & 0x0f) * 4, 0);
+        /* Only the TTL halfword changed (the header checksum was verified on
+         * ingress), so update the checksum incrementally instead of summing
+         * the whole header again. */
+        uint16_t old_word = (uint16_t)((uint16_t)ttl << 8 | p[9]);
+        uint16_t new_word = (uint16_t)((uint16_t)(ttl - 1) << 8 | p[9]);
+        uint16_t csum = tr_checksum16_update((uint16_t)(p[10] << 8 | p[11]),
+                                             old_word, new_word);
         p[10] = (uint8_t)(csum >> 8);
         p[11] = (uint8_t)csum;
     }
@@ -2135,7 +2379,7 @@ static void l3_forward6(struct tr_engine *e, int worker,
 
 static void l3_ingress(struct tr_engine *e, int worker,
                        struct tr_runtime *rt, int if_slot,
-                       struct rte_mbuf *m)
+                       struct rte_mbuf *m, bool tagged)
 {
     const struct tr_iface *iface = rt_iface(rt, if_slot);
     uint8_t *p;
@@ -2150,7 +2394,7 @@ static void l3_ingress(struct tr_engine *e, int worker,
     len = mlen(m);
     if (len < ETH_HLEN)
         goto drop;
-    if (pkt_tagged(m)) {
+    if (tagged) {
         uint16_t vid;
         if (pkt_strip_vlan(m, &vid))
             goto drop;
@@ -2174,7 +2418,9 @@ static void l3_ingress(struct tr_engine *e, int worker,
         uint32_t ihl = (uint32_t)(ip[0] & 0x0f) * 4;
         if ((ip[0] >> 4) != 4 || ihl < 20 || len < l3off + ihl)
             goto drop;
-        if (tr_checksum16(ip, ihl, 0) != 0)
+        if ((m->ol_flags & RTE_MBUF_F_RX_IP_CKSUM_MASK) !=
+                RTE_MBUF_F_RX_IP_CKSUM_GOOD &&
+            tr_checksum16(ip, ihl, 0) != 0)
             goto drop;
         total = (uint32_t)(ip[2] << 8 | ip[3]);
         if (total < ihl || l3off + total > len)
@@ -2196,7 +2442,7 @@ static void l3_ingress(struct tr_engine *e, int worker,
                                          (uint16_t)(ip[4] << 8 | ip[5]),
                                          ip[9], ip, ihl, frag_off, more,
                                          ip + ihl, total - ihl,
-                                         tr_monotonic_ms(), &out);
+                                         pkt_now(e, worker), &out);
                 if (rc == 1) {
                     reasm_output(e, worker, rt, if_slot, &out);
                 } else if (rc < 0) {
@@ -2244,7 +2490,7 @@ static void l3_ingress(struct tr_engine *e, int worker,
             memcpy(&dst.u.v6, ip + 24, 16);
             int rc = tr_reasm6_input(&e->reasm[worker], if_slot, &src, &dst, id, nh,
                                      ip, 40, frag_off, more, ip + 48,
-                                     plen - 8, tr_monotonic_ms(), &out);
+                                     plen - 8, pkt_now(e, worker), &out);
             if (rc == 1)
                 reasm_output(e, worker, rt, if_slot, &out);
             else if (rc < 0 && if_slot_stats_valid(e, worker, if_slot))
@@ -2295,7 +2541,7 @@ static void bridge_ingress(struct tr_engine *e, int worker,
     uint32_t len = mlen(m);
     uint8_t dstmac[6];
     int out_slot;
-    uint64_t now = tr_monotonic_ms();
+    uint64_t now = pkt_now(e, worker);
     int copies = 0;
 
     if (!iface || iface->bridge < 0 || len < ETH_HLEN)
@@ -2358,7 +2604,10 @@ static void engine_input_slot(struct tr_engine *e, int worker,
         rte_pktmbuf_free(m);
         return;
     }
-    if (iface->kind == TR_IF_ETHERNET && pkt_tagged(m)) {
+    /* Evaluate the tag once here and pass the result down: l3_ingress needs
+     * the same bit and used to recompute it for every packet. */
+    bool tagged = pkt_tagged(m);
+    if (iface->kind == TR_IF_ETHERNET && tagged) {
         uint8_t *p = mtod(m);
         uint16_t vid = (uint16_t)((p[14] << 8 | p[15]) & 0x0fff);
         int child = rt_vlan_lookup(rt, if_slot, vid);
@@ -2368,6 +2617,7 @@ static void engine_input_slot(struct tr_engine *e, int worker,
                 rte_pktmbuf_free(m);
                 return;
             }
+            tagged = false;
             if_slot = child;
             iface = rt_iface(rt, child);
             if (!iface) {
@@ -2376,13 +2626,14 @@ static void engine_input_slot(struct tr_engine *e, int worker,
                 return;
             }
             /* Logical VLAN tap: untagged frame selected by the tag. */
-            tr_capture_tap_exact(e->capture, if_slot, TR_CAP_RX, m);
+            if (pkt_capture_on(e, worker))
+                tr_capture_tap_exact(e->capture, if_slot, TR_CAP_RX, m);
         }
     }
     if (iface->bridge >= 0)
         bridge_ingress(e, worker, rt, if_slot, m);
     else
-        l3_ingress(e, worker, rt, if_slot, m);
+        l3_ingress(e, worker, rt, if_slot, m, tagged);
 }
 
 int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
@@ -2399,8 +2650,14 @@ int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
     }
     if (n == 0)
         return 0;
-    for (uint16_t i = 0; i < n; i++)
-        tr_capture_tap(e->capture, if_slot, TR_CAP_RX, mbufs[i]);
+    /* Snapshot time and capture state for the whole burst: one clock read and
+     * one capture-flag read instead of one of each per packet. */
+    e->now_ms[worker] = tr_monotonic_ms();
+    e->capture_on[worker] = tr_capture_is_active(e->capture);
+    if (e->capture_on[worker]) {
+        for (uint16_t i = 0; i < n; i++)
+            tr_capture_tap(e->capture, if_slot, TR_CAP_RX, mbufs[i]);
+    }
     uint64_t bytes = 0;
     for (uint16_t i = 0; i < n; i++)
         bytes += mlen(mbufs[i]);
@@ -2412,6 +2669,7 @@ int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
         engine_input_slot(e, worker, rt, if_slot, mbufs[i]);
     }
     runtime_read_exit(e, worker);
+    stats_tx_flush(e, worker);
     stats_rx_bulk(e, worker, if_slot, n, bytes);
     return 0;
 }
@@ -2641,7 +2899,7 @@ static void send_router_solicit(struct tr_engine *e, int if_slot,
     uint16_t csum = tr_checksum16_finish(sum);
     icmp[2] = (uint8_t)(csum >> 8);
     icmp[3] = (uint8_t)csum;
-    egress_frame(e, 0, rt, if_slot, m);
+    egress_frame(e, e->workers, rt, if_slot, m);
     pthread_rwlock_unlock(&e->rt_lock);
 }
 
@@ -2660,11 +2918,75 @@ void tr_engine_send_router_solicitations(struct tr_engine *e)
     e->rs_sent = true;
 }
 
+static int trace_select_path(struct tr_engine *e, struct tr_runtime *rt,
+                            const struct tr_ip *target, const char *interface,
+                            const struct tr_ip *source, int *egress,
+                            struct tr_ip *chosen, struct tr_ip *next_hop,
+                            char *err, size_t errlen)
+{
+    struct tr_iface *iface = NULL;
+    struct tr_fib_result res;
+    bool route_ok = false;
+
+    *egress = -1;
+    *next_hop = *target;
+    if (interface && interface[0]) {
+        iface = tr_config_find(&rt->cfg, interface);
+        if (!iface || (iface->kind != TR_IF_ETHERNET &&
+                       iface->kind != TR_IF_VLAN)) {
+            snprintf(err, errlen, "unknown/non-L3 interface '%s'", interface);
+            return -1;
+        }
+        *egress = iface->slot;
+    }
+    if (tr_ip_is_linklocal(target) && *egress >= 0) {
+        route_ok = true;
+    } else if (!tr_fib_lookup(&rt->fib, target, &res) &&
+               res.route->if_slot >= 0) {
+        if (*egress < 0)
+            *egress = res.route->if_slot;
+        if (*egress != res.route->if_slot) {
+            snprintf(err, errlen, "target is not routed via %s", interface);
+            return -1;
+        }
+        if (res.route->connected)
+            *next_hop = *target;
+        else if (res.route->has_via)
+            *next_hop = res.route->via;
+        route_ok = true;
+    } else if (*egress >= 0) {
+        route_ok = true;
+    }
+    if (!route_ok || *egress < 0) {
+        snprintf(err, errlen, "no route to target");
+        return -1;
+    }
+    iface = rt_iface(rt, *egress);
+    if (!iface || iface->kind == TR_IF_TUNNEL) {
+        snprintf(err, errlen, "unsupported egress interface");
+        return -1;
+    }
+    if (source && source->family) {
+        if (source->family != target->family ||
+            !is_local_if(rt, *egress, source)) {
+            snprintf(err, errlen,
+                     "source address is not local to the egress interface");
+            return -1;
+        }
+        *chosen = *source;
+    } else if (pick_addr(rt, *egress, target->family,
+                         tr_ip_is_linklocal(target), chosen)) {
+        snprintf(err, errlen, "no source address on %s", iface->name);
+        return -1;
+    }
+    return 0;
+}
+
 static int ping_send_packet(struct tr_engine *e, struct tr_runtime *rt,
                             int if_slot, const struct tr_ip *next_hop,
                             const struct tr_ip *source,
                             const struct tr_ip *target, uint16_t id,
-                            uint16_t seq, size_t payload_len)
+                            uint16_t seq, size_t payload_len, uint8_t ttl)
 {
     const struct tr_iface *iface = rt_iface(rt, if_slot);
     bool v4 = target->family == TR_AF_INET;
@@ -2686,7 +3008,7 @@ static int ping_send_packet(struct tr_engine *e, struct tr_runtime *rt,
         p[13] = ETH_TYPE_IPV4 & 0xff;
         build_ip4(p + 14, 20 + 8 + (uint32_t)payload_len, IPPROTO_ICMP,
                   (const uint8_t *)&source->u.v4,
-                  (const uint8_t *)&target->u.v4, 64, id);
+                  (const uint8_t *)&target->u.v4, ttl, id);
         icmp = p + 34;
         icmp[0] = ICMP_ECHO;
     } else {
@@ -2694,7 +3016,7 @@ static int ping_send_packet(struct tr_engine *e, struct tr_runtime *rt,
         p[13] = ETH_TYPE_IPV6 & 0xff;
         build_ip6(p + 14, (uint16_t)(8 + payload_len), IPPROTO_ICMPV6,
                   (const uint8_t *)&source->u.v6,
-                  (const uint8_t *)&target->u.v6, 64);
+                  (const uint8_t *)&target->u.v6, ttl);
         icmp = p + 54;
         icmp[0] = ICMPV6_ECHO_REQUEST;
     }
@@ -2728,7 +3050,7 @@ static int ping_send_packet(struct tr_engine *e, struct tr_runtime *rt,
     uint64_t now = tr_monotonic_ms();
     if (tr_neigh_get(t, if_slot, next_hop, mac, now, &state)) {
         memcpy(p, mac, 6);
-        egress_frame(e, 0, rt, if_slot, m);
+        egress_frame(e, e->workers, rt, if_slot, m);
         return 0;
     }
     if (tr_neigh_queue(t, if_slot, next_hop, m, now)) {
@@ -2736,7 +3058,8 @@ static int ping_send_packet(struct tr_engine *e, struct tr_runtime *rt,
         return -1;
     }
     if (tr_neigh_request_allowed(t, if_slot, next_hop, now, 1000))
-        send_neighbor_request(e, 0, rt, if_slot, next_hop, next_hop->family);
+        send_neighbor_request(e, e->workers, rt, if_slot, next_hop,
+                              next_hop->family);
     return 0;
 }
 
@@ -2760,9 +3083,10 @@ int tr_engine_ping(struct tr_engine *e, const struct tr_ip *target,
     *out = NULL;
     tr_ip_ntop(target, tbuf, sizeof(tbuf));
     pthread_mutex_lock(&e->ping.lock);
-    if (e->ping.active) {
+    if (e->ping.active ||
+        atomic_load_explicit(&e->trace.active, memory_order_relaxed)) {
         pthread_mutex_unlock(&e->ping.lock);
-        if (asprintf(out, "ping: another ping is already running\n") < 0)
+        if (asprintf(out, "ping: another probe is already running\n") < 0)
             *out = NULL;
         return -1;
     }
@@ -2863,7 +3187,7 @@ int tr_engine_ping(struct tr_engine *e, const struct tr_ip *target,
         pthread_mutex_unlock(&e->ping.lock);
 
         int rc = ping_send_packet(e, rt, egress, &next_hop, &chosen, &tgt,
-                                  id, (uint16_t)i, payload_len);
+                                  id, (uint16_t)i, payload_len, 64);
         pthread_rwlock_unlock(&e->rt_lock);
         if (rc) {
             fprintf(f, "ping: send failed\n");
@@ -2909,6 +3233,157 @@ int tr_engine_ping(struct tr_engine *e, const struct tr_ip *target,
     pthread_mutex_lock(&e->ping.lock);
     atomic_store_explicit(&e->ping.active, false, memory_order_release);
     pthread_mutex_unlock(&e->ping.lock);
+    *out = buf;
+    return 0;
+}
+
+int tr_engine_traceroute(struct tr_engine *e, const struct tr_ip *target,
+                         const char *interface, const struct tr_ip *source,
+                         int max_hops, int probes, int timeout_ms,
+                         size_t payload_len, char **out)
+{
+    char *buf = NULL;
+    size_t blen = 0;
+    FILE *f;
+    struct tr_ip tgt;
+    char tbuf[96];
+    uint16_t id;
+
+    if (!e || !target || !out || max_hops < 1 ||
+        max_hops > TR_TRACE_MAX_HOPS || probes < 1 ||
+        probes > TR_TRACE_MAX_PROBES || timeout_ms < 100 ||
+        payload_len < 8 || payload_len > 1400)
+        return -1;
+    *out = NULL;
+    tr_ip_ntop(target, tbuf, sizeof(tbuf));
+    pthread_mutex_lock(&e->trace.lock);
+    if (e->trace.active || atomic_load_explicit(&e->ping.active,
+                                                memory_order_relaxed)) {
+        pthread_mutex_unlock(&e->trace.lock);
+        if (asprintf(out, "traceroute: another probe is already running\n") < 0)
+            *out = NULL;
+        return -1;
+    }
+    id = ++e->trace_id;
+    if (id == 0)
+        id = ++e->trace_id;
+    tgt = *target;
+    e->trace.id = id;
+    e->trace.target = tgt;
+    e->trace.replied = false;
+    e->trace.reply_kind = 0;
+    atomic_store_explicit(&e->trace.active, true, memory_order_release);
+    pthread_mutex_unlock(&e->trace.lock);
+
+    f = open_memstream(&buf, &blen);
+    if (!f) {
+        atomic_store_explicit(&e->trace.active, false, memory_order_release);
+        return -1;
+    }
+    fprintf(f, "traceroute to %s, %d hops max, %zu byte packets\n", tbuf,
+            max_hops, payload_len);
+    uint16_t seq = 0;
+    bool reached = false;
+
+    for (int ttl = 1; ttl <= max_hops && !reached; ttl++) {
+        struct tr_ip responder = {0};
+        bool got = false;
+        bool hop_dest = false;
+        double times[TR_TRACE_MAX_PROBES];
+        bool got_probe[TR_TRACE_MAX_PROBES];
+        memset(times, 0, sizeof(times));
+        memset(got_probe, 0, sizeof(got_probe));
+
+        for (int p = 0; p < probes; p++) {
+            struct tr_runtime *rt;
+            struct tr_ip chosen = {0}, next_hop;
+            int egress = -1;
+            char err[128];
+            uint64_t sent_ns, deadline;
+            int kind = 0;
+            uint64_t rtt_ns = 0;
+
+            pthread_rwlock_rdlock(&e->rt_lock);
+            rt = e->rt;
+            if (trace_select_path(e, rt, &tgt, interface, source, &egress,
+                                  &chosen, &next_hop, err, sizeof(err))) {
+                fprintf(f, "traceroute: %s\n", err);
+                pthread_rwlock_unlock(&e->rt_lock);
+                goto done;
+            }
+            pthread_mutex_lock(&e->trace.lock);
+            e->trace.seq = seq;
+            e->trace.replied = false;
+            e->trace.reply_kind = 0;
+            e->trace.source = chosen;
+            e->trace.sent_ns = tr_monotonic_ns();
+            sent_ns = e->trace.sent_ns;
+            pthread_mutex_unlock(&e->trace.lock);
+            int rc = ping_send_packet(e, rt, egress, &next_hop, &chosen,
+                                      &tgt, id, seq, payload_len,
+                                      (uint8_t)ttl);
+            pthread_rwlock_unlock(&e->rt_lock);
+            seq++;
+            if (rc) {
+                fprintf(f, "traceroute: send failed\n");
+                goto done;
+            }
+            deadline = tr_monotonic_ms() + (uint64_t)timeout_ms;
+            bool replied = false;
+            for (;;) {
+                pthread_mutex_lock(&e->trace.lock);
+                replied = e->trace.replied;
+                kind = e->trace.reply_kind;
+                responder = e->trace.responder;
+                rtt_ns = e->trace.rtt_ns;
+                pthread_mutex_unlock(&e->trace.lock);
+                if (replied || tr_monotonic_ms() >= deadline)
+                    break;
+                usleep(10000);
+            }
+            (void)sent_ns;
+            if (replied) {
+                got = true;
+                got_probe[p] = true;
+                times[p] = (double)rtt_ns / 1e6;
+                if (kind == 2) {
+                    hop_dest = true;
+                    reached = true;
+                } else {
+                    responder = e->trace.responder;
+                }
+            }
+            if (hop_dest)
+                break;
+        }
+
+        fprintf(f, "%2d", ttl);
+        if (!got) {
+            for (int p = 0; p < probes; p++)
+                fprintf(f, "  *");
+            fprintf(f, "\n");
+        } else {
+            char rbuf[96];
+            tr_ip_ntop(&responder, rbuf, sizeof(rbuf));
+            fprintf(f, "  %-40s", rbuf);
+            for (int p = 0; p < probes; p++) {
+                if (got_probe[p])
+                    fprintf(f, "  %.3f ms", times[p]);
+                else
+                    fprintf(f, "  *");
+            }
+            fprintf(f, "\n");
+        }
+        if (hop_dest)
+            fprintf(f, "Trace complete.\n");
+        if (!hop_dest && ttl == max_hops)
+            fprintf(f, "Trace stopped at max hops.\n");
+    }
+done:
+    fclose(f);
+    pthread_mutex_lock(&e->trace.lock);
+    atomic_store_explicit(&e->trace.active, false, memory_order_release);
+    pthread_mutex_unlock(&e->trace.lock);
     *out = buf;
     return 0;
 }

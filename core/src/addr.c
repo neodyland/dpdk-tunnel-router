@@ -138,20 +138,6 @@ int tr_prefix_ntop(const struct tr_prefix *p, char *buf, size_t len)
     return n < 0 || (size_t)n >= len ? -1 : 0;
 }
 
-bool tr_ip_equal(const struct tr_ip *a, const struct tr_ip *b)
-{
-    if (!a || !b || a->family != b->family)
-        return false;
-    switch (a->family) {
-    case TR_AF_INET:
-        return a->u.v4.s_addr == b->u.v4.s_addr;
-    case TR_AF_INET6:
-        return memcmp(&a->u.v6, &b->u.v6, sizeof(a->u.v6)) == 0;
-    default:
-        return true;
-    }
-}
-
 bool tr_ip_is_unspecified(const struct tr_ip *a)
 {
     if (!a)

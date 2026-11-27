@@ -638,9 +638,9 @@ static void capture_tap_impl(struct tr_capture *cap, int if_slot,
 {
     if (!cap || !m)
         return;
-    uint64_t gen = atomic_load_explicit(&cap->generation, memory_order_relaxed);
     if (!atomic_load_explicit(&cap->active, memory_order_acquire))
         return;
+    uint64_t gen = atomic_load_explicit(&cap->generation, memory_order_relaxed);
     atomic_fetch_add_explicit(&cap->inflight, 1, memory_order_acquire);
     if (!atomic_load_explicit(&cap->active, memory_order_acquire) ||
         atomic_load_explicit(&cap->generation, memory_order_relaxed) != gen) {
@@ -693,6 +693,11 @@ static void capture_tap_impl(struct tr_capture *cap, int if_slot,
         rte_ring_enqueue(cap->free_ring, slot);
     }
     atomic_fetch_sub_explicit(&cap->inflight, 1, memory_order_release);
+}
+
+bool tr_capture_is_active(const struct tr_capture *cap)
+{
+    return cap && atomic_load_explicit(&cap->active, memory_order_acquire);
 }
 
 void tr_capture_tap(struct tr_capture *cap, int if_slot, unsigned direction,

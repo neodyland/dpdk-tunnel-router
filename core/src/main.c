@@ -485,6 +485,90 @@ static int ping_command(struct app *a, int argc, char **argv, char **body,
     return 0;
 }
 
+static int traceroute_command(struct app *a, int argc, char **argv,
+                              char **body, char **error_text)
+{
+    struct tr_ip target;
+    struct tr_ip source = {0};
+    const char *interface = NULL;
+    int max_hops = 30;
+    int probes = 3;
+    int timeout_ms = 1000;
+    uint32_t payload = 32;
+    bool have_source = false;
+
+    if (argc < 2)
+        return fail_msg(error_text,
+                        "traceroute <IPv4|IPv6> [max-hops N] [probes N] "
+                        "[timeout MS] [size BYTES] [source ADDR] "
+                        "[interface IF]\n");
+    if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "-h") == 0 ||
+        strcmp(argv[1], "--help") == 0)
+        return body_msg(body,
+                        "traceroute <IPv4|IPv6> [max-hops N] [probes N]\n"
+                        "           [timeout MS] [size BYTES]\n"
+                        "           [source ADDR] [interface IF]\n"
+                        "  max-hops  1..64 (default 30)\n"
+                        "  probes    1..5 per hop (default 3)\n"
+                        "  timeout   100..10000 ms per probe (default 1000)\n"
+                        "  size      8..1400 ICMP payload bytes (default 32)\n"
+                        "  source    local source address\n"
+                        "  interface Ethernet/VLAN egress\n");
+    if (tr_ip_parse(argv[1], &target))
+        return fail_msg(error_text, "invalid traceroute target '%s'\n",
+                        argv[1]);
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "max-hops") == 0 || strcmp(argv[i], "-m") == 0) {
+            uint32_t v;
+            if (++i >= argc || tr_parse_u32(argv[i], 1, 64, &v))
+                return fail_msg(error_text, "max-hops must be 1..64\n");
+            max_hops = (int)v;
+        } else if (strcmp(argv[i], "probes") == 0 ||
+                   strcmp(argv[i], "-q") == 0) {
+            uint32_t v;
+            if (++i >= argc || tr_parse_u32(argv[i], 1, 5, &v))
+                return fail_msg(error_text, "probes must be 1..5\n");
+            probes = (int)v;
+        } else if (strcmp(argv[i], "timeout") == 0 ||
+                   strcmp(argv[i], "-W") == 0) {
+            uint32_t v;
+            if (++i >= argc || tr_parse_u32(argv[i], 100, 10000, &v))
+                return fail_msg(error_text, "timeout must be 100..10000 ms\n");
+            timeout_ms = (int)v;
+        } else if (strcmp(argv[i], "size") == 0 ||
+                   strcmp(argv[i], "-s") == 0) {
+            if (++i >= argc || tr_parse_u32(argv[i], 8, 1400, &payload))
+                return fail_msg(error_text, "size must be 8..1400\n");
+        } else if (strcmp(argv[i], "source") == 0 ||
+                   strcmp(argv[i], "-S") == 0) {
+            if (++i >= argc || tr_ip_parse(argv[i], &source))
+                return fail_msg(error_text, "invalid source address\n");
+            have_source = true;
+        } else if (strcmp(argv[i], "interface") == 0 ||
+                   strcmp(argv[i], "-I") == 0) {
+            if (++i >= argc)
+                return fail_msg(error_text, "interface requires a name\n");
+            interface = argv[i];
+        } else {
+            return fail_msg(error_text, "unknown traceroute option '%s'\n",
+                            argv[i]);
+        }
+    }
+    char *out = NULL;
+    int rc = tr_engine_traceroute(a->engine, &target, interface,
+                                  have_source ? &source : NULL, max_hops,
+                                  probes, timeout_ms, payload, &out);
+    if (rc) {
+        if (out) {
+            rc = fail_msg(error_text, "%s", out);
+            free(out);
+        }
+        return rc;
+    }
+    *body = out;
+    return 0;
+}
+
 static int capture_command(struct app *a, int argc, char **argv, char **body,
                            char **error_text)
 {
@@ -698,6 +782,10 @@ static int control_execute(void *arg, void *session, const char *line,
 
     if (strcmp(argv[0], "ping") == 0) {
         rc = ping_command(a, argc, argv, body, error_text);
+        goto out;
+    }
+    if (strcmp(argv[0], "traceroute") == 0) {
+        rc = traceroute_command(a, argc, argv, body, error_text);
         goto out;
     }
     if (strcmp(argv[0], "configure") == 0 || strcmp(argv[0], "config") == 0) {

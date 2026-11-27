@@ -123,6 +123,7 @@ static void general_help(FILE *f, bool config_mode)
     fprintf(f, "  set protocols static route ?\n");
     fprintf(f, "  show ?                     operational show topics\n");
     fprintf(f, "  ping <IPv4|IPv6> ?         data-plane ICMP echo help\n");
+    fprintf(f, "  traceroute <IPv4|IPv6> ?   data-plane traceroute help\n");
     fprintf(f, "  tcpdump ?                  packet capture help\n");
     fprintf(f, "  delete ?                   deletion forms\n\n");
     if (!config_mode) {
@@ -130,6 +131,7 @@ static void general_help(FILE *f, bool config_mode)
         fprintf(f, "  show ...                   display running state\n");
         fprintf(f, "  configure                  enter configuration mode\n");
         fprintf(f, "  ping <IPv4|IPv6>           ICMP echo through the data plane\n");
+        fprintf(f, "  traceroute <IPv4|IPv6>     ICMP traceroute through the data plane\n");
         fprintf(f, "  tcpdump start|stop|status  pcap capture\n");
         fprintf(f, "  exit | quit                leave the CLI\n\n");
         fprintf(f, "Configuration changes require configuration mode.\n");
@@ -145,6 +147,7 @@ static void general_help(FILE *f, bool config_mode)
         fprintf(f, "  save                       persist running configuration\n");
         fprintf(f, "  discard | rollback         discard candidate changes\n");
         fprintf(f, "  ping <IPv4|IPv6>           ICMP echo via the data plane\n");
+        fprintf(f, "  traceroute <IPv4|IPv6>     ICMP traceroute via the data plane\n");
         fprintf(f, "  read | exit | end          return to read mode\n\n");
         fprintf(f, "Uncommitted or unsaved changes cannot be left with "
                    "exit/read.\n");
@@ -633,6 +636,28 @@ static void route_help(FILE *f)
             "addresses; do not add them as static routes.\n");
 }
 
+static void traceroute_help(FILE *f)
+{
+    fprintf(f,
+            "traceroute\n\n"
+            "  traceroute <IPv4|IPv6> [max-hops N] [probes N]\n"
+            "             [timeout MS] [size BYTES]\n"
+            "             [source ADDR] [interface IF]\n\n"
+            "  max-hops  1..64 (default 30)\n"
+            "  probes    1..5 per hop (default 3)\n"
+            "  timeout   100..10000 ms per probe (default 1000)\n"
+            "  size      8..1400 ICMP payload bytes (default 32)\n"
+            "  source    local source address\n"
+            "  interface Ethernet/VLAN egress\n\n"
+            "Echo requests with increasing TTL/Hop Limit are sent through the\n"
+            "router data plane.  ICMP Time Exceeded and Echo Reply messages\n"
+            "are used to build the hop list.\n\n"
+            "Examples:\n"
+            "  traceroute 192.0.2.1\n"
+            "  traceroute 2001:db8::1 max-hops 20 probes 2\n"
+            "  traceroute 198.51.100.2 interface eth1\n");
+}
+
 static void ping_help(FILE *f)
 {
     fprintf(f,
@@ -787,6 +812,8 @@ int tr_help_command(const struct tr_config *cfg, int nports, bool config_mode,
         general_help(f, config_mode);
     } else if (strcmp(a0, "ping") == 0) {
         ping_help(f);
+    } else if (strcmp(a0, "traceroute") == 0) {
+        traceroute_help(f);
     } else if (strcmp(a0, "set") == 0) {
         if (argc == 1) {
             set_overview(f, cfg);
