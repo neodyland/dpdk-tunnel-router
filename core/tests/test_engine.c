@@ -604,6 +604,130 @@ static struct rte_mbuf *build_outer_etherip6(struct rte_mempool *mp,
     return m;
 }
 
+/* A TCP SYN-ACK leaving the tunnel must be clamped before it is forwarded to
+ * the LAN.  Clamping only on the transmit side would let the far side
+ * advertise its 9000-MTU MSS to a LAN host, so the host would send segments
+ * that the 1500-MTU underlay has to fragment. */
+static int test_mss_clamp_decap(struct rte_mempool *mp, struct capture *cap)
+{
+    struct tr_config cfg, env_cfg;
+    struct tr_config_env env;
+    struct tr_engine *e;
+    char err[256];
+    const uint8_t eth0_mac[6] = {0x02, 0, 0, 0, 0, 1};
+    const uint8_t tun_mac[6] = {0x02, 0, 0, 0, 0, 0xaa};
+    const uint8_t lan_mac[6] = {0x02, 0, 0, 0, 0, 0xee};
+    const uint8_t peer_mac[6] = {0x02, 0, 0, 0, 0, 0xdd};
+    struct in6_addr me6, peer6;
+
+    setup_config(&cfg, &env);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth0 port 0") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0 address 192.0.2.1/24") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0 address 2001:db8::1/64") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces tunnel tun0 remote 2001:db8::2") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces tunnel tun0 local-address 2001:db8::1") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces tunnel tun0 local-interface eth0") == 0);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces tunnel tun0 mtu 9000") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces tunnel tun0 encapsulation etherip6") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces tunnel tun0 tcp-mss auto") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces tunnel tun0 address 10.0.0.1/30") == 0);
+    CHECK(set_mac(&cfg, "eth0", eth0_mac) == 0);
+    CHECK(set_mac(&cfg, "tun0", tun_mac) == 0);
+    e = tr_engine_create(&(struct tr_engine_params){.n_ports = 2,
+                                                    .workers = 1,
+                                                    .mp = mp},
+                         err, sizeof(err));
+    CHECK(e != NULL);
+    tr_engine_set_tx(e, capture_tx, cap);
+    CHECK(tr_engine_apply(e, &cfg, err, sizeof(err)) == 0);
+    tr_engine_config_copy(e, &env_cfg);
+    int eth0 = tr_config_find_const(&env_cfg, "eth0")->slot;
+
+    inet_pton(AF_INET6, "2001:db8::1", &me6);
+    inet_pton(AF_INET6, "2001:db8::2", &peer6);
+
+    /* Resolve the LAN next hop 192.0.2.2 -> lan_mac. */
+    struct in_addr lan_ip, me_ip;
+    inet_pton(AF_INET, "192.0.2.2", &lan_ip);
+    inet_pton(AF_INET, "192.0.2.1", &me_ip);
+    struct rte_mbuf *arp =
+        build_arp(mp, eth0_mac, lan_mac, 2, lan_mac, &lan_ip, eth0_mac, &me_ip);
+    CHECK(arp != NULL);
+    CHECK(tr_engine_input(e, 0, eth0, arp) == 0);
+    capture_reset(cap);
+
+    /* Inner SYN-ACK from the far side (10.0.0.2) to the LAN host, advertising
+     * the far side's 9000-MTU MSS. */
+    uint32_t tcp_len = 24; /* 20-byte header + MSS option */
+    uint32_t ip_total = 20 + tcp_len;
+    struct rte_mbuf *inner = alloc_frame(mp, 14 + ip_total);
+    CHECK(inner != NULL);
+    uint8_t *p = mtod(inner);
+    eth_fill(p, tun_mac, lan_mac, 0x0800);
+    uint8_t *ip = p + 14;
+    ip[0] = 0x45;
+    ip[2] = (uint8_t)(ip_total >> 8);
+    ip[3] = (uint8_t)ip_total;
+    ip[6] = 0x40;
+    ip[8] = 64;
+    ip[9] = 6;
+    inet_pton(AF_INET, "10.0.0.2", ip + 12);
+    inet_pton(AF_INET, "192.0.2.2", ip + 16);
+    uint8_t *tcp = ip + 20;
+    tcp[0] = 0x00;
+    tcp[1] = 0x50; /* source port 80 */
+    tcp[2] = 0x30;
+    tcp[3] = 0x00; /* destination port 12288 */
+    tcp[12] = 6 << 4;
+    tcp[13] = 0x12; /* SYN | ACK */
+    tcp[20] = 2;
+    tcp[21] = 4;
+    tcp[22] = 0x23;
+    tcp[23] = 0x00; /* MSS 8960 */
+    uint16_t c = ip_checksum(ip, 20);
+    ip[10] = (uint8_t)(c >> 8);
+    ip[11] = (uint8_t)c;
+    c = tcp_checksum4(ip, tcp_len);
+    tcp[16] = (uint8_t)(c >> 8);
+    tcp[17] = (uint8_t)c;
+
+    struct rte_mbuf *outer =
+        build_outer_etherip6(mp, eth0_mac, peer_mac, &peer6, &me6, inner);
+    CHECK(outer != NULL);
+    rte_pktmbuf_free(inner);
+    CHECK(tr_engine_input(e, 0, eth0, outer) == 0);
+    CHECK(cap->n == 1);
+    CHECK(cap->slot[0] == eth0);
+
+    uint8_t *q = mtod(cap->m[0]);
+    CHECK((q[12] << 8 | q[13]) == 0x0800);
+    CHECK(memcmp(q, lan_mac, 6) == 0);
+    CHECK(memcmp(q + 6, eth0_mac, 6) == 0);
+    CHECK(q[22] == 63); /* TTL decremented */
+    uint8_t *tcp2 = q + 14 + 20;
+    CHECK(tcp2[12] == (6 << 4) && tcp2[13] == 0x12);
+    CHECK(tcp2[20] == 2 && tcp2[21] == 4);
+    /* 1500 - 42 (outer IPv6 + EtherIP) - 14 (inner Ethernet)
+     *      - 40 (inner IPv4 + TCP) = 1404 */
+    CHECK((tcp2[22] << 8 | tcp2[23]) == 1404);
+    uint16_t stored = (uint16_t)(tcp2[16] << 8 | tcp2[17]);
+    tcp2[16] = 0;
+    tcp2[17] = 0;
+    CHECK(tcp_checksum4(q + 14, tcp_len) == stored);
+
+    capture_reset(cap);
+    tr_engine_destroy(e);
+    return 0;
+}
+
 static int test_tunnel_overlay(struct rte_mempool *mp, struct capture *cap)
 {
     struct tr_config cfg, env_cfg;
@@ -778,7 +902,9 @@ static int test_tunnel_overlay(struct rte_mempool *mp, struct capture *cap)
     CHECK(tcp2[12] == (6 << 4) && tcp2[13] == 0x02);
     CHECK(tcp2[20] == 2 && tcp2[21] == 4);
     uint16_t mss = (uint16_t)(tcp2[22] << 8 | tcp2[23]);
-    CHECK(mss == 1418); /* 1500 - 42 outer - 40 IPv4/TCP */
+    /* 1500 - 42 (outer IPv6 + EtherIP) - 14 (inner Ethernet)
+     *      - 40 (inner IPv4 + TCP) = 1404 */
+    CHECK(mss == 1404);
     uint16_t stored = (uint16_t)(tcp2[16] << 8 | tcp2[17]);
     tcp2[16] = 0;
     tcp2[17] = 0;
@@ -1597,6 +1723,7 @@ int main(void)
     rc |= test_ipv4_route(mp, &cap);
     rc |= test_ndp(mp, &cap);
     rc |= test_tunnel_overlay(mp, &cap);
+    rc |= test_mss_clamp_decap(mp, &cap);
     rc |= test_vlan(mp, &cap);
     rc |= test_vlan_autoconf(mp, &cap);
     rc |= test_bridge(mp, &cap);

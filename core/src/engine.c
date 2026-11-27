@@ -1496,7 +1496,9 @@ static int mss_clamp_frame(struct tr_engine *e, int worker,
     uint16_t max_mss, old_mss;
     int mss_off = -1;
 
-    if (t->tcp_mss < 0 || len < 34)
+    /* The rewrite touches bytes anywhere in the TCP header, so only a
+     * contiguous single-segment frame can be clamped safely. */
+    if (t->tcp_mss < 0 || len < 34 || !pkt_single(m))
         return 0;
     if (len >= 18 && p[12] == 0x81 && p[13] == 0x00) {
         l3off = 18;
@@ -1561,9 +1563,12 @@ static int mss_clamp_frame(struct tr_engine *e, int worker,
         const struct tr_iface *under = rt_iface(rt, under_slot);
         if (!under || under->mtu < 100)
             return 0;
-        int inner_hdr = family == 4 ? 40 : 60;
+        /* outer IP packet = outer header (IP + EtherIP)
+         *                 + inner Ethernet header
+         *                 + inner IP header + TCP header + MSS  */
+        int inner_hdr = family == 4 ? 40 : 60; /* inner IP + TCP */
         int outer_hdr = t->family == 4 ? 22 : 42;
-        int v = (int)under->mtu - outer_hdr - inner_hdr;
+        int v = (int)under->mtu - outer_hdr - ETH_HLEN - inner_hdr;
         if (v < 64)
             v = 64;
         max_mss = (uint16_t)v;
@@ -1828,6 +1833,12 @@ static void process_outer(struct tr_engine *e, int worker,
     if (if_slot_stats_valid(e, worker, tslot))
         atomic_fetch_add_explicit(&e->stats[tslot][worker].reasm_ok, 1,
                                   memory_order_relaxed);
+    /* Clamp TCP MSS on frames leaving the tunnel as well.  Clamping only on
+     * the transmit side would leave a SYN-ACK coming out of the tunnel
+     * unmodified, so a host on a large-MTU LAN would keep advertising (and
+     * accepting) segments large enough that every one of them has to be
+     * fragmented by the underlay. */
+    mss_clamp_frame(e, worker, rt, t, ingress, m);
     tr_capture_tap(e->capture, tslot, TR_CAP_RX, m);
     engine_input_slot(e, worker, rt, tslot, m);
 }
@@ -2731,6 +2742,13 @@ static void process_ra_events(struct tr_engine *e, bool *dirty)
                 }
             }
             if (slot) {
+                /* Refreshing the lifetime of an unchanged default route does
+                 * not alter the FIB, so it must not trigger a runtime rebuild
+                 * (which pauses every worker and invalidates the per-worker
+                 * caches).  Only real changes are marked dirty. */
+                bool changed = !slot->used ||
+                               slot->if_slot != ev->if_slot ||
+                               !tr_ip_equal(&slot->via, &ev->router);
                 slot->used = true;
                 slot->if_slot = ev->if_slot;
                 memset(&slot->prefix, 0, sizeof(slot->prefix));
@@ -2741,7 +2759,8 @@ static void process_ra_events(struct tr_engine *e, bool *dirty)
                     ev->lifetime == 0xffffffffu
                         ? 0
                         : now + (uint64_t)ev->lifetime * 1000;
-                *dirty = true;
+                if (changed)
+                    *dirty = true;
             }
             continue;
         }
@@ -2777,13 +2796,18 @@ static void process_ra_events(struct tr_engine *e, bool *dirty)
             }
         }
         if (slot) {
+            bool changed = !slot->used ||
+                           slot->if_slot != ev->if_slot ||
+                           !tr_ip_equal(&slot->prefix.addr, &prefix.addr) ||
+                           slot->prefix.plen != prefix.plen;
             slot->used = true;
             slot->if_slot = ev->if_slot;
             slot->prefix = prefix;
             slot->expires_ms =
                 ev->valid == 0xffffffffu ? 0
                                          : now + (uint64_t)ev->valid * 1000;
-            *dirty = true;
+            if (changed)
+                *dirty = true;
         }
     }
     pthread_rwlock_unlock(&e->rt_lock);

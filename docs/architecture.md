@@ -178,7 +178,7 @@ request / NDP NS を送ります。解決応答を受けるとキューをフラ
 
 ```
 inner Ethernet
-  → mss_clamp_frame()（TCP SYN/SYN-ACK、設定時）
+  → mss_clamp_frame()（TCP SYN/SYN-ACK、設定時。受信側は decap 直後にも適用）
   → driver->encap()（外側 IP + EtherIP）
   → underlay next-hop 解決
   → 外側 IP 長 > underlay MTU なら frag4/frag6
@@ -303,13 +303,32 @@ runtime が再構築されます。
 max_mss = underlay_mtu
           - outer_ip_header (20 or 40)
           - tunnel_header (2)
+          - inner_ethernet_header (14)
           - inner_ip_header (20 or 40)
           - tcp_header (20)
 ```
 
+内側 Ethernet ヘッダーを引くのは、EtherIP が内側フレーム全体（Ethernet
+ヘッダー込み）をカプセル化するためです。これを忘れると max_mss が 14 byte
+大きくなり、クランプ後も外側パケットがアンダーレイ MTU を超えて毎回
+フラグメントされます。
+
 固定値の場合はその値。既存 MSS が max 以下なら変更しません。MSS を書き換えた
 場合は TCP チェックサムを擬似ヘッダー込みで再計算します。対象は SYN が立って
-いる TCP パケットで、IP フラグメントの 2 個目以降は対象外です。
+いる TCP パケットで、IP フラグメントの 2 個目以降と、単一セグメントでない
+mbuf は対象外です。
+
+適用位置は 2 箇所です。
+
+| 方向 | 場所 |
+| --- | --- |
+| トンネルへ入る（カプセル化前） | `tunnel_send()` |
+| トンネルから出る（再投入前） | `process_outer()`（decap 直後） |
+
+両方向に適用しないと、例えば 9000 MTU の LAN ホストとトンネル越しのサーバの
+間で、サーバが広告した MSS がそのまま LAN ホストに届き、LAN ホストが 9 KB
+セグメントを送ってしまいます。アンダーレイはそれを 7 フラグメントに分割する
+ことになり、1 つのフラグメント損失で 9 KB の TCP セグメント全体が失われます。
 
 ## 8. 起動と終了
 

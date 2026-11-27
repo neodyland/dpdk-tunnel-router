@@ -38,7 +38,7 @@ C + DPDK で動く L2/L3 トンネルルーターです。データプレーン�
 | EtherIP (RFC 3378) | `encapsulation etherip6`（外側 IPv6 のみ）と `encapsulation etherip`（外側 IPv4/IPv6）。IP protocol 97、EtherIP version 3 |
 | トンネルドライバー | C の小さな vtable と Rust の `TunnelDriver` trait。組み込みドライバーに加え、`--plugin` で Rust 製 `.so` を追加可能 |
 | オーバーレイ MTU > アンダーレイ MTU | 外側 IPv4 フラグメント / IPv6 Fragment Header を送信時に生成。受信側でワーカーごとに再組み立て。内側 9000 byte を外側 1500 byte で運べる |
-| TCP MSS clamping | `tcp-mss auto / none / N`。SYN/SYN-ACK の MSS オプションを書き換え、TCP チェックサムを再計算 |
+| TCP MSS clamping | `tcp-mss auto / none / N`。トンネルを出入りする SYN/SYN-ACK の MSS オプションを双方向で書き換え、TCP チェックサムを再計算 |
 | Ethernet ARP / NDP | ARP request/reply、NDP NS/NA、近隣キャッシュ、未解決パケットのキューイング、リンクローカル自動生成 |
 | IPv6 autoconf | `address ipv6 autoconf` で RA を受信し、SLAAC アドレスとデフォルトルートを動的にインストール |
 | VLAN | `set interfaces ethernet eth0 vlan-id 10 ...` で `eth0.10` を作成。タグ終端、L3、ブリッジメンバーに対応 |
@@ -432,8 +432,11 @@ set protocols static route <IPv4/IPv6 prefix> via <same-family next-hop>
   デフォルトルートをインストールします。
 - ブリッジの children は L2 インタフェース（Ethernet / VLAN / Tunnel）です。
   L3 アドレスを持つインタフェースはブリッジメンバーにできません。
-- `tcp-mss auto` はアンダーレイ MTU から外側ヘッダーと内側 IP/TCP ヘッダーを
-  引いた値にクランプします。`none` で無効、数値で固定です。
+- `tcp-mss auto` はアンダーレイ MTU から外側ヘッダー、内側 Ethernet ヘッダー、
+  内側 IP/TCP ヘッダーを引いた値にクランプします。`none` で無効、数値で固定です。
+  クランプはトンネルに入る SYN と、トンネルから出る SYN-ACK の両方に適用します
+  （片方向だけだと、大きい MTU 側のホストが広告した MSS を相手がそのまま使い、
+  アンダーレイで全パケットをフラグメントすることになります）。
 - 新規トンネルの `encapsulation` 省略時は `etherip`（IPv4/IPv6 両対応）です。
   コマンドの順序に依存せず `remote` を先に設定できます。
 - 静的ルートの next-hop はルートと同じアドレスファミリである必要があります。
