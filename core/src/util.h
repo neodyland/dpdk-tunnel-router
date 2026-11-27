@@ -66,6 +66,43 @@ static inline uint16_t tr_checksum16(const void *data, size_t len,
     return tr_checksum16_finish(tr_checksum_add(seed, data, len));
 }
 
+/* Verify the IPv4 header checksum (RFC 1071): a valid header, checksum field
+ * included, sums to 0xFFFF.  The header is 20 bytes in virtually all traffic,
+ * so that case is unrolled; other lengths fall back to the generic loop. */
+static inline bool tr_ip4_cksum_ok(const void *data, size_t len)
+{
+    uint32_t sum;
+
+#if defined(__GNUC__) && defined(__BYTE_ORDER__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (len == 20) {
+        const uint8_t *p = data;
+        uint32_t w0, w1, w2, w3, w4;
+
+        memcpy(&w0, p, 4);
+        memcpy(&w1, p + 4, 4);
+        memcpy(&w2, p + 8, 4);
+        memcpy(&w3, p + 12, 4);
+        memcpy(&w4, p + 16, 4);
+        w0 = __builtin_bswap32(w0);
+        w1 = __builtin_bswap32(w1);
+        w2 = __builtin_bswap32(w2);
+        w3 = __builtin_bswap32(w3);
+        w4 = __builtin_bswap32(w4);
+        sum = (w0 & 0xffffu) + (w0 >> 16) + (w1 & 0xffffu) + (w1 >> 16) +
+              (w2 & 0xffffu) + (w2 >> 16) + (w3 & 0xffffu) + (w3 >> 16) +
+              (w4 & 0xffffu) + (w4 >> 16);
+        sum = (sum & 0xffffu) + (sum >> 16);
+        sum = (sum & 0xffffu) + (sum >> 16);
+        return sum == 0xffffu;
+    }
+#endif
+    sum = tr_checksum_add(0, data, len);
+    sum = (sum & 0xffffu) + (sum >> 16);
+    sum = (sum & 0xffffu) + (sum >> 16);
+    return sum == 0xffffu;
+}
+
 /* Update a valid one's complement checksum after a single 16-bit word changed
  * from `old_word` to `new_word` (RFC 1624 equation 3).  Cost is constant, so
  * a header whose only modification is the TTL does not need to be re-summed. */

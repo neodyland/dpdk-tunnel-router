@@ -22,6 +22,12 @@
  * rounds with the best round reported, which discards rounds perturbed by
  * external interference.  Compare builds with "cyc/pkt".
  *
+ * TR_BENCH_ROUNDS (default 5, max 200) raises the number of interleaved
+ * rounds.  On a shared host a single round can be stretched arbitrarily by
+ * hypervisor steal time, so a larger round count is what makes the reported
+ * "best of N" a reproducible lower bound; both sides of an A/B comparison
+ * must use the same value.
+ *
  * This is not a NIC benchmark.  Run it after `make` with `make bench`.
  */
 #include "config.h"
@@ -42,6 +48,7 @@
 
 #define BENCH_TOTAL 1000000
 #define BENCH_ROUNDS 5
+#define BENCH_ROUNDS_MAX 200
 #define BENCH_WARMUP 100000
 #define BENCH_BATCH 32
 #define BENCH_FRAME_LEN 64
@@ -192,7 +199,14 @@ int main(void)
     struct tr_config_env env;
     struct capture_count cap = {0};
     double best_single = 0, best_burst = 0;
+    int rounds = BENCH_ROUNDS;
+    const char *env_rounds = getenv("TR_BENCH_ROUNDS");
 
+    if (env_rounds && atoi(env_rounds) > 0) {
+        rounds = atoi(env_rounds);
+        if (rounds > BENCH_ROUNDS_MAX)
+            rounds = BENCH_ROUNDS_MAX;
+    }
     if (rte_eal_init(7, eal_argv) < 0) {
         fprintf(stderr, "EAL init failed\n");
         return 1;
@@ -274,15 +288,15 @@ int main(void)
 
     /* Interleave the modes so that frequency drift and external interference
      * are shared between them; report the best round of each. */
-    for (int round = 0; round < BENCH_ROUNDS; round++) {
-        printf("-- round %d/%d\n", round + 1, BENCH_ROUNDS);
+    for (int round = 0; round < rounds; round++) {
+        printf("-- round %d/%d\n", round + 1, rounds);
         if (run_single(engine, eth0, mp, BENCH_TOTAL, &best_single))
             return 1;
         if (run_burst(engine, eth0, mp, BENCH_TOTAL, &best_burst))
             return 1;
     }
     printf("== best of %d interleaved rounds (cyc/pkt, lower is better)\n",
-           BENCH_ROUNDS);
+           rounds);
     printf("single: %.1f\n", best_single);
     printf("burst:  %.1f\n", best_burst);
     printf("tx packets: %llu\n", (unsigned long long)cap.packets);

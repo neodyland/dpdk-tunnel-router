@@ -51,7 +51,8 @@
 #define TR_DYN_ADDR_MAX 64
 #define TR_DYN_ROUTE_MAX 64
 #define TR_RA_QUEUE 64
-#define TR_RT_CACHE_SIZE 1024
+#define TR_RT_CACHE4_SIZE 1024
+#define TR_RT_CACHE6_SIZE 256
 #define TR_NEIGH_CACHE_SIZE 512
 #define TR_NEIGH_CACHE_TTL_MS 2000
 #define TR_PING_MAX 64
@@ -84,14 +85,6 @@ struct tr_trace_state {
     struct tr_ip target;
     struct tr_ip source;
     struct tr_ip responder;
-};
-
-struct tr_rt_cache_entry {
-    uint64_t generation;
-    uint8_t family;
-    struct tr_ip dst;
-    const struct tr_fib_route *route;
-    uint16_t plen;
 };
 
 struct tr_neigh_cache_entry {
@@ -165,6 +158,10 @@ struct tr_vlan_map_entry {
 struct tr_runtime {
     uint64_t generation;
     struct tr_config cfg;
+    /* Present interfaces by slot.  struct tr_iface is ~0.5 KiB wide, so
+     * indexing cfg.ifaces[] by slot needs a multiply and touches a cold line;
+     * the hot path only needs the pointer. */
+    struct tr_iface *iface_ptrs[TR_MAX_IFACES];
     struct tr_fib fib;
     struct tr_tunnel_rt tunnel[TR_MAX_IFACES];
     struct tr_local_addr locals[TR_LOCAL_MAX];
@@ -174,6 +171,38 @@ struct tr_runtime {
     int tunnel_head[TR_TUNNEL_HASH_SIZE];
     int16_t tunnel_next[TR_MAX_IFACES];
 };
+
+/* The IPv4 route cache holds the whole entry in 16 bytes, so the 1024-entry
+ * table is 16 KiB and stays in L1.  The earlier layout carried a 64-bit
+ * runtime generation and the full 20-byte struct tr_ip per slot (40 bytes,
+ * 40 KiB), which pushed every lookup out of L1 and showed up as one of the
+ * hottest functions in the profile.  Cache coherency with the runtime
+ * generation is kept by clearing the tables when the generation changes
+ * (below) instead of storing the generation in every entry. */
+struct tr_rt_cache4 {
+    uint32_t addr; /* IPv4 destination, network byte order; 0 = empty slot */
+    uint16_t plen;
+    uint16_t pad;
+    const struct tr_fib_route *route;
+};
+
+struct tr_rt_cache6 {
+    struct tr_ip dst;
+    uint32_t plen;
+    const struct tr_fib_route *route;
+};
+
+/* Per-packet TX accounting is the hottest bookkeeping in the forwarding path.
+ * Instead of updating three separate arrays per packet (pending packets,
+ * pending bytes and the dirty bitmap), the worker accumulates into one
+ * cache-line-sized struct while the egress interface stays the same -- the
+ * normal case for a burst -- and the generic per-interface arrays are only
+ * touched when the egress slot changes or at the end of the burst. */
+struct tr_tx_acc {
+    int slot;    /* interface being accumulated, -1 when idle */
+    uint64_t pkts;
+    uint64_t bytes;
+} __attribute__((aligned(64)));
 
 struct tr_engine {
     pthread_rwlock_t rt_lock;
@@ -199,7 +228,12 @@ struct tr_engine {
     uint64_t tx_pending_pkts[TR_MAX_WORKERS][TR_MAX_IFACES];
     uint64_t tx_pending_bytes[TR_MAX_WORKERS][TR_MAX_IFACES];
     uint64_t tx_dirty[TR_MAX_WORKERS][TR_STATS_WORDS];
-    struct tr_rt_cache_entry rt_cache[TR_MAX_WORKERS][TR_RT_CACHE_SIZE];
+    struct tr_tx_acc tx_acc[TR_MAX_WORKERS];
+    struct tr_rt_cache4 rt_cache4[TR_MAX_WORKERS][TR_RT_CACHE4_SIZE];
+    struct tr_rt_cache6 rt_cache6[TR_MAX_WORKERS][TR_RT_CACHE6_SIZE];
+    /* Generation the per-worker route caches were filled for; a mismatch
+     * clears them (see fib_lookup_cached()). */
+    uint64_t rt_cache_gen[TR_MAX_WORKERS];
     struct tr_neigh_cache_entry
         neigh_cache[TR_MAX_WORKERS][TR_NEIGH_CACHE_SIZE];
 
@@ -240,7 +274,8 @@ static void free_mbuf_cb(void *pkt)
  * Callers outside the worker range (control-plane transmissions) get a live
  * reading instead, so ping/traceroute and route solicitation keep their
  * existing timing behaviour. */
-static inline uint64_t pkt_now(const struct tr_engine *e, int worker)
+static inline __attribute__((always_inline)) uint64_t
+pkt_now(const struct tr_engine *e, int worker)
 {
     if (worker >= 0 && worker < e->workers)
         return e->now_ms[worker];
@@ -251,38 +286,43 @@ static inline uint64_t pkt_now(const struct tr_engine *e, int worker)
  * a capture takes effect at the next burst boundary (at most one RX burst of
  * packets, i.e. a few microseconds).  The packet filter itself is still
  * evaluated per packet inside the capture code. */
-static inline bool pkt_capture_on(const struct tr_engine *e, int worker)
+static inline __attribute__((always_inline)) bool
+pkt_capture_on(const struct tr_engine *e, int worker)
 {
     if (worker >= 0 && worker < e->workers)
         return e->capture_on[worker];
     return tr_capture_is_active(e->capture);
 }
 
-static struct tr_iface *rt_iface(struct tr_runtime *rt, int slot)
+static inline __attribute__((always_inline)) struct tr_iface *
+rt_iface(struct tr_runtime *rt, int slot)
 {
-    if (!rt || slot < 0 || slot >= TR_MAX_IFACES)
+    if (!rt || (unsigned)slot >= (unsigned)TR_MAX_IFACES)
         return NULL;
-    return rt->cfg.ifaces[slot].present ? &rt->cfg.ifaces[slot] : NULL;
+    return rt->iface_ptrs[slot];
 }
 
-static const struct tr_iface *rt_iface_c(const struct tr_runtime *rt, int slot)
+static inline __attribute__((always_inline)) const struct tr_iface *
+rt_iface_c(const struct tr_runtime *rt, int slot)
 {
-    if (!rt || slot < 0 || slot >= TR_MAX_IFACES)
+    if (!rt || (unsigned)slot >= (unsigned)TR_MAX_IFACES)
         return NULL;
-    return rt->cfg.ifaces[slot].present ? &rt->cfg.ifaces[slot] : NULL;
+    return rt->iface_ptrs[slot];
 }
 
-static uint8_t *mtod(struct rte_mbuf *m)
+static inline __attribute__((always_inline)) uint8_t *mtod(struct rte_mbuf *m)
 {
     return rte_pktmbuf_mtod(m, uint8_t *);
 }
 
-static uint32_t mlen(const struct rte_mbuf *m)
+static inline __attribute__((always_inline)) uint32_t
+mlen(const struct rte_mbuf *m)
 {
     return rte_pktmbuf_pkt_len(m);
 }
 
-static int pkt_single(const struct rte_mbuf *m)
+static inline __attribute__((always_inline)) int
+pkt_single(const struct rte_mbuf *m)
 {
     return rte_pktmbuf_is_contiguous(m) && m->nb_segs == 1;
 }
@@ -325,16 +365,41 @@ static void stats_rx_bulk(struct tr_engine *e, int worker, int if_slot,
     }
 }
 
-static void stats_tx(struct tr_engine *e, int worker, int if_slot,
-                     uint32_t len)
+/* Fold the worker's per-interface accumulator into the pending arrays. */
+static inline void tx_acc_fold(struct tr_engine *e, int worker)
+{
+    struct tr_tx_acc *a = &e->tx_acc[worker];
+
+    if (a->slot < 0)
+        return;
+    e->tx_pending_pkts[worker][a->slot] += a->pkts;
+    e->tx_pending_bytes[worker][a->slot] += a->bytes;
+    e->tx_dirty[worker][a->slot / 64] |= 1ull << (a->slot % 64);
+    a->slot = -1;
+    a->pkts = 0;
+    a->bytes = 0;
+}
+
+static inline __attribute__((always_inline)) void
+stats_tx(struct tr_engine *e, int worker, int if_slot, uint32_t len)
 {
     if (if_slot < 0 || if_slot >= TR_MAX_IFACES)
         return;
     if (worker >= 0 && worker < e->workers) {
-        e->tx_pending_pkts[worker][if_slot]++;
-        e->tx_pending_bytes[worker][if_slot] += len;
-        e->tx_dirty[worker][if_slot / 64] |=
-            1ull << (if_slot % 64);
+        struct tr_tx_acc *a = &e->tx_acc[worker];
+
+        /* Bursts almost always egress one interface; keep the running total
+         * in a single cache line and only fold it when the interface
+         * changes. */
+        if (a->slot == if_slot) {
+            a->pkts++;
+            a->bytes += len;
+            return;
+        }
+        tx_acc_fold(e, worker);
+        a->slot = if_slot;
+        a->pkts = 1;
+        a->bytes = len;
         return;
     }
     if (worker >= 0 && worker < TR_MAX_WORKERS) {
@@ -355,6 +420,7 @@ static void stats_tx_flush(struct tr_engine *e, int worker)
 {
     if (worker < 0 || worker >= e->workers)
         return;
+    tx_acc_fold(e, worker);
     for (int w = 0; w < TR_STATS_WORDS; w++) {
         uint64_t bits = e->tx_dirty[worker][w];
         e->tx_dirty[worker][w] = 0;
@@ -494,6 +560,9 @@ static int runtime_build(struct tr_engine *e, const struct tr_config *cfg,
     }
     rt->generation = ++e->generation;
     tr_config_copy(&rt->cfg, cfg);
+    for (int i = 0; i < TR_MAX_IFACES; i++)
+        rt->iface_ptrs[i] =
+            rt->cfg.ifaces[i].present ? &rt->cfg.ifaces[i] : NULL;
     tr_fib_init(&rt->fib);
     for (int i = 0; i < TR_MAX_IFACES; i++) {
         const struct tr_iface *iface = &rt->cfg.ifaces[i];
@@ -666,6 +735,7 @@ struct tr_engine *tr_engine_create(const struct tr_engine_params *params,
     for (int i = 0; i < TR_MAX_WORKERS; i++) {
         e->now_ms[i] = tr_monotonic_ms();
         e->capture_on[i] = false;
+        e->tx_acc[i].slot = -1;
     }
     pthread_rwlock_init(&e->rt_lock, NULL);
     pthread_mutex_init(&e->ra_lock, NULL);
@@ -881,8 +951,8 @@ static const struct tr_iface *iface_by_slot_rt(const struct tr_runtime *rt,
 }
 
 
-static bool is_local_if(const struct tr_runtime *rt, int if_slot,
-                        const struct tr_ip *ip)
+static inline __attribute__((always_inline)) bool
+is_local_if(const struct tr_runtime *rt, int if_slot, const struct tr_ip *ip)
 {
     /* Small tables are cheaper to scan than to hash; anything larger uses the
      * open-addressed map built by local_add(). */
@@ -957,16 +1027,12 @@ static uint32_t checksum_add_pseudo6(uint32_t sum, const uint8_t *src,
 static void tunnel_send(struct tr_engine *e, int worker,
                         struct tr_runtime *rt, int if_slot,
                         struct rte_mbuf *m);
-static unsigned rt_cache_hash(const struct tr_ip *ip)
+static unsigned rt_cache_hash6(const struct tr_ip *ip)
 {
-    if (ip->family == TR_AF_INET) {
-        uint32_t x = ntohl(ip->u.v4.s_addr);
-        x *= 2654435761u;
-        return (unsigned)(x ^ (x >> 16));
-    }
     uint32_t w[4];
-    memcpy(w, ip->u.v6.s6_addr, sizeof(w));
     uint32_t h = 2166136261u;
+
+    memcpy(w, ip->u.v6.s6_addr, sizeof(w));
     for (int i = 0; i < 4; i++) {
         h ^= w[i];
         h *= 16777619u;
@@ -978,26 +1044,41 @@ static int fib_lookup_cached(struct tr_engine *e, int worker,
                              struct tr_runtime *rt, const struct tr_ip *dst,
                              struct tr_fib_result *out)
 {
-    struct tr_rt_cache_entry *c;
-    unsigned idx;
-
     if (!e || worker < 0 || worker >= e->workers)
         return tr_fib_lookup(&rt->fib, dst, out);
-    idx = rt_cache_hash(dst) & (TR_RT_CACHE_SIZE - 1);
-    c = &e->rt_cache[worker][idx];
-    if (c->generation == rt->generation && c->family == dst->family &&
-        c->route && tr_ip_equal(&c->dst, dst)) {
+    if (dst->family == TR_AF_INET) {
+        /* Multiplicative hash on the raw network-order address: one multiply
+         * and a shift, no byte swap. */
+        uint32_t addr = dst->u.v4.s_addr;
+        uint32_t x = addr * 2654435761u;
+        struct tr_rt_cache4 *c =
+            &e->rt_cache4[worker][(x >> 22) & (TR_RT_CACHE4_SIZE - 1)];
+
+        if (c->addr == addr && c->route) {
+            out->route = c->route;
+            out->prefix_len = c->plen;
+            return 0;
+        }
+        if (tr_fib_lookup(&rt->fib, dst, out))
+            return -1;
+        c->addr = addr;
+        c->plen = (uint16_t)out->prefix_len;
+        c->route = out->route;
+        return 0;
+    }
+    struct tr_rt_cache6 *c =
+        &e->rt_cache6[worker][rt_cache_hash6(dst) & (TR_RT_CACHE6_SIZE - 1)];
+
+    if (c->route && tr_ip_equal(&c->dst, dst)) {
         out->route = c->route;
-        out->prefix_len = c->plen;
+        out->prefix_len = (int)c->plen;
         return 0;
     }
     if (tr_fib_lookup(&rt->fib, dst, out))
         return -1;
-    c->generation = rt->generation;
-    c->family = dst->family;
     c->dst = *dst;
+    c->plen = (uint32_t)out->prefix_len;
     c->route = out->route;
-    c->plen = (uint16_t)out->prefix_len;
     return 0;
 }
 
@@ -1032,18 +1113,21 @@ static int neigh_lookup_cached(struct tr_engine *e, int worker,
     return 0;
 }
 
-static void resolve_and_send(struct tr_engine *e, int worker,
-                             struct tr_runtime *rt, int if_slot,
-                             const struct tr_ip *next_hop,
-                             struct rte_mbuf *m);
+static void resolve_and_send_at(struct tr_engine *e, int worker,
+                                struct tr_runtime *rt,
+                                const struct tr_iface *iface,
+                                const struct tr_ip *next_hop,
+                                struct rte_mbuf *m);
 static void send_neighbor_request(struct tr_engine *e, int worker,
                                   struct tr_runtime *rt, int if_slot,
                                   const struct tr_ip *target, uint8_t family);
 
+/* `iface` is the egress interface already resolved by the caller: the
+ * forwarding path looks each interface up once instead of once per helper. */
 static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
-                    int if_slot, struct rte_mbuf *m)
+                    int if_slot, const struct tr_iface *iface,
+                    struct rte_mbuf *m)
 {
-    const struct tr_iface *iface = iface_by_slot_rt(rt, if_slot);
     uint32_t maxlen;
 
     if (!iface || !m) {
@@ -1090,20 +1174,25 @@ static void l2_emit(struct tr_engine *e, int worker, struct tr_runtime *rt,
     e->tx(e->tx_arg, worker, if_slot, m);
 }
 
-static void egress_frame(struct tr_engine *e, int worker,
-                         struct tr_runtime *rt, int if_slot,
-                         struct rte_mbuf *m)
+static inline __attribute__((always_inline)) void
+egress_frame_iface(struct tr_engine *e, int worker, struct tr_runtime *rt,
+                   const struct tr_iface *iface, struct rte_mbuf *m)
 {
-    const struct tr_iface *iface = iface_by_slot_rt(rt, if_slot);
-
     if (!iface) {
         rte_pktmbuf_free(m);
         return;
     }
     if (iface->kind == TR_IF_TUNNEL)
-        tunnel_send(e, worker, rt, if_slot, m);
+        tunnel_send(e, worker, rt, iface->slot, m);
     else
-        l2_emit(e, worker, rt, if_slot, m);
+        l2_emit(e, worker, rt, iface->slot, iface, m);
+}
+
+static void egress_frame(struct tr_engine *e, int worker,
+                         struct tr_runtime *rt, int if_slot,
+                         struct rte_mbuf *m)
+{
+    egress_frame_iface(e, worker, rt, iface_by_slot_rt(rt, if_slot), m);
 }
 
 static int build_ip4(uint8_t *p, uint32_t len, uint8_t proto,
@@ -1481,14 +1570,17 @@ static void send_neighbor_request(struct tr_engine *e, int worker,
         send_ndp_ns(e, worker, rt, if_slot, target);
 }
 
-static void resolve_and_send(struct tr_engine *e, int worker,
-                             struct tr_runtime *rt, int if_slot,
-                             const struct tr_ip *next_hop,
-                             struct rte_mbuf *m)
+/* `iface` is the resolved egress interface for the next hop, so the frame can
+ * be handed to the egress path without another slot lookup. */
+static inline __attribute__((always_inline)) void
+resolve_and_send_at(struct tr_engine *e, int worker, struct tr_runtime *rt,
+                    const struct tr_iface *iface,
+                    const struct tr_ip *next_hop, struct rte_mbuf *m)
 {
     uint8_t mac[6];
     uint8_t state = 0;
     struct tr_neigh_table *t;
+    int if_slot = iface->slot;
     uint64_t now = pkt_now(e, worker);
 
     if (!m || (next_hop->family != TR_AF_INET &&
@@ -1502,7 +1594,7 @@ static void resolve_and_send(struct tr_engine *e, int worker,
                             &state)) {
         if (mlen(m) >= 6)
             memcpy(mtod(m), mac, 6);
-        egress_frame(e, worker, rt, if_slot, m);
+        egress_frame_iface(e, worker, rt, iface, m);
         return;
     }
     if (tr_neigh_queue(t, if_slot, next_hop, m, now)) {
@@ -1691,11 +1783,10 @@ static void send_outer_frame(struct tr_engine *e, int worker,
         return;
     }
     p = mtod(m);
-    memset(p, 0, 6);
     memcpy(p + 6, under->mac, 6);
     p[12] = family == 4 ? ETH_TYPE_IPV4 >> 8 : ETH_TYPE_IPV6 >> 8;
     p[13] = family == 4 ? ETH_TYPE_IPV4 & 0xff : ETH_TYPE_IPV6 & 0xff;
-    resolve_and_send(e, worker, rt, under_slot, next_hop, m);
+    resolve_and_send_at(e, worker, rt, under, next_hop, m);
 }
 
 static void tunnel_send(struct tr_engine *e, int worker,
@@ -2294,6 +2385,41 @@ drop:
     rte_pktmbuf_free(m);
 }
 
+/* Slow path of IPv4 forwarding: the egress interface MTU is smaller than the
+ * packet, so the datagram has to be fragmented.  It is deliberately a
+ * separate out-of-line function because the descriptor array it needs
+ * (TR_FRAG_MAX_OUT * 16 = 2 KiB) used to be part of l3_forward4()'s stack
+ * frame, which every forwarded packet paid for in the function prologue.
+ * Fraction of traffic that reaches this path: MTU mismatch only. */
+static __attribute__((noinline)) void forward4_fragment(
+    struct tr_engine *e, int worker, struct tr_runtime *rt, int in_slot,
+    const struct tr_iface *egress, struct rte_mbuf *m, const uint8_t *ip,
+    uint32_t ip_len, const struct tr_ip *next_hop)
+{
+    struct tr_frag_packet frags[TR_FRAG_MAX_OUT];
+    int nf = tr_frag4(ip, ip_len, egress->mtu, frags, TR_FRAG_MAX_OUT);
+
+    if (nf <= 0) {
+        stats_drop_reason(e, worker, in_slot, TR_DROP_FRAG);
+        rte_pktmbuf_free(m);
+        return;
+    }
+    for (int i = 0; i < nf; i++) {
+        struct rte_mbuf *frag_m = pkt_alloc(e, ETH_HLEN + frags[i].len);
+        if (!frag_m) {
+            free(frags[i].data);
+            continue;
+        }
+        memcpy(mtod(frag_m) + ETH_HLEN, frags[i].data, frags[i].len);
+        free(frags[i].data);
+        memcpy(mtod(frag_m) + 6, egress->mac, 6);
+        mtod(frag_m)[12] = ETH_TYPE_IPV4 >> 8;
+        mtod(frag_m)[13] = ETH_TYPE_IPV4 & 0xff;
+        resolve_and_send_at(e, worker, rt, egress, next_hop, frag_m);
+    }
+    rte_pktmbuf_free(m);
+}
+
 static void l3_forward4(struct tr_engine *e, int worker,
                         struct tr_runtime *rt, int if_slot,
                         struct rte_mbuf *m, uint32_t l3off, const uint8_t *ip,
@@ -2305,7 +2431,6 @@ static void l3_forward4(struct tr_engine *e, int worker,
     uint8_t *p = mtod(m) + l3off;
     uint8_t ttl = p[8];
     bool df = (p[6] & 0x40) != 0;
-    struct rte_mbuf *frag_m;
 
     dst.family = TR_AF_INET;
     memcpy(&dst.u.v4, p + 16, 4);
@@ -2348,29 +2473,9 @@ static void l3_forward4(struct tr_engine *e, int worker,
             rte_pktmbuf_free(m);
             return;
         }
-        struct tr_frag_packet frags[TR_FRAG_MAX_OUT];
-        int nf = tr_frag4(ip, ip_len, egress->mtu, frags, TR_FRAG_MAX_OUT);
-        if (nf <= 0) {
-            stats_drop_reason(e, worker, if_slot, TR_DROP_FRAG);
-            rte_pktmbuf_free(m);
-            return;
-        }
         next_hop = res.route->has_via ? res.route->via : dst;
-        for (int i = 0; i < nf; i++) {
-            frag_m = pkt_alloc(e, ETH_HLEN + frags[i].len);
-            if (!frag_m) {
-                free(frags[i].data);
-                continue;
-            }
-            memcpy(mtod(frag_m) + ETH_HLEN, frags[i].data, frags[i].len);
-            free(frags[i].data);
-            memcpy(mtod(frag_m) + 6, egress->mac, 6);
-            memset(mtod(frag_m), 0, 6);
-            mtod(frag_m)[12] = ETH_TYPE_IPV4 >> 8;
-            mtod(frag_m)[13] = ETH_TYPE_IPV4 & 0xff;
-            resolve_and_send(e, worker, rt, egress->slot, &next_hop, frag_m);
-        }
-        rte_pktmbuf_free(m);
+        forward4_fragment(e, worker, rt, if_slot, egress, m, ip, ip_len,
+                          &next_hop);
         return;
     }
     p[8] = (uint8_t)(ttl - 1);
@@ -2397,8 +2502,7 @@ static void l3_forward4(struct tr_engine *e, int worker,
     }
     next_hop = res.route->has_via ? res.route->via : dst;
     memcpy(mtod(m) + 6, egress->mac, 6);
-    memset(mtod(m), 0, 6);
-    resolve_and_send(e, worker, rt, egress->slot, &next_hop, m);
+    resolve_and_send_at(e, worker, rt, egress, &next_hop, m);
 }
 
 static void l3_forward6(struct tr_engine *e, int worker,
@@ -2453,15 +2557,14 @@ static void l3_forward6(struct tr_engine *e, int worker,
     p[7]--;
     next_hop = res.route->has_via ? res.route->via : dst;
     memcpy(mtod(m) + 6, egress->mac, 6);
-    memset(mtod(m), 0, 6);
-    resolve_and_send(e, worker, rt, egress->slot, &next_hop, m);
+    resolve_and_send_at(e, worker, rt, egress, &next_hop, m);
 }
 
 static void l3_ingress(struct tr_engine *e, int worker,
                        struct tr_runtime *rt, int if_slot,
-                       struct rte_mbuf *m, bool tagged)
+                       const struct tr_iface *iface, struct rte_mbuf *m,
+                       bool tagged)
 {
-    const struct tr_iface *iface = rt_iface(rt, if_slot);
     uint8_t *p;
     uint32_t len;
     uint16_t type;
@@ -2513,7 +2616,7 @@ static void l3_ingress(struct tr_engine *e, int worker,
         }
         if ((m->ol_flags & RTE_MBUF_F_RX_IP_CKSUM_MASK) !=
                 RTE_MBUF_F_RX_IP_CKSUM_GOOD &&
-            tr_checksum16(ip, ihl, 0) != 0) {
+            !tr_ip4_cksum_ok(ip, ihl)) {
             why = TR_DROP_RX_CKSUM;
             goto drop;
         }
@@ -2638,9 +2741,9 @@ drop:
 
 static void bridge_ingress(struct tr_engine *e, int worker,
                            struct tr_runtime *rt, int if_slot,
+                           const struct tr_iface *iface,
                            struct rte_mbuf *m)
 {
-    const struct tr_iface *iface = rt_iface(rt, if_slot);
     const struct tr_iface *br;
     uint8_t *p = mtod(m);
     uint32_t len = mlen(m);
@@ -2751,9 +2854,9 @@ static void engine_input_slot(struct tr_engine *e, int worker,
     }
 unknown_vlan:
     if (iface->bridge >= 0)
-        bridge_ingress(e, worker, rt, if_slot, m);
+        bridge_ingress(e, worker, rt, if_slot, iface, m);
     else
-        l3_ingress(e, worker, rt, if_slot, m, tagged);
+        l3_ingress(e, worker, rt, if_slot, iface, m, tagged);
 }
 
 int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
@@ -2779,11 +2882,20 @@ int tr_engine_input_burst(struct tr_engine *e, int worker, int if_slot,
             tr_capture_tap(e->capture, if_slot, TR_CAP_RX, mbufs[i]);
     }
     uint64_t bytes = 0;
-    for (uint16_t i = 0; i < n; i++)
-        bytes += mlen(mbufs[i]);
     runtime_read_enter(e, worker);
     rt = atomic_load_explicit(&e->rt_fast, memory_order_acquire);
+    if (e->rt_cache_gen[worker] != rt->generation) {
+        /* A new runtime means new route pointers; drop the cached ones
+         * instead of tagging every entry with the generation.  Happens once
+         * per configuration change, not per packet. */
+        memset(e->rt_cache4[worker], 0, sizeof(e->rt_cache4[worker]));
+        memset(e->rt_cache6[worker], 0, sizeof(e->rt_cache6[worker]));
+        e->rt_cache_gen[worker] = rt->generation;
+    }
     for (uint16_t i = 0; i < n; i++) {
+        /* One pass over the burst: the length needed for the RX byte counter
+         * is read here instead of in a separate pre-pass. */
+        bytes += mlen(mbufs[i]);
         if (i + 1 < n)
             rte_prefetch0(rte_pktmbuf_mtod(mbufs[i + 1], void *));
         engine_input_slot(e, worker, rt, if_slot, mbufs[i]);

@@ -15,13 +15,17 @@ OBJS    := $(patsubst src/%.c,$(OBJ)/%.o,$(SRC))
 TEST_SRC:= $(wildcard tests/*.c)
 TESTS   := $(patsubst tests/%.c,$(BUILD)/%,$(TEST_SRC))
 BENCH   := $(BUILD)/engine_bench
+PROF    := $(BUILD)/engine_prof
+AB      := $(BUILD)/engine_ab
+AB_BASE ?=
+AB_REF  := $(BUILD)/engine_ref.o
 
 CFLAGS  ?= -O3 -g
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wshadow -Wformat=2 -Wno-unused-parameter \
            -D_GNU_SOURCE -DTR_VERSION=\"$(VERSION)\" -pthread -Isrc $(DPDK_CFLAGS)
 LDFLAGS += $(DPDK_LIBS) -pthread -ldl -lm
 
-.PHONY: all clean test tests bench
+.PHONY: all clean test tests bench prof prof-run ab ab-run
 all: $(BIN)
 
 $(OBJ)/%.o: src/%.c
@@ -49,6 +53,39 @@ $(BENCH): bench/engine_bench.c $(LIB)
 bench: $(BENCH)
 	@mkdir -p $(ROOT)/run $(ROOT)/tmp
 	XDG_RUNTIME_DIR=$(ROOT)/run TMPDIR=$(ROOT)/tmp $(BENCH)
+
+# Development-only statistical profiler (see bench/engine_prof.c).
+$(PROF): bench/engine_prof.c $(LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+prof: $(PROF)
+
+prof-run: $(PROF)
+	@mkdir -p $(ROOT)/run $(ROOT)/tmp
+	XDG_RUNTIME_DIR=$(ROOT)/run TMPDIR=$(ROOT)/tmp $(PROF)
+
+# Interleaved A/B harness: links a reference build of engine.c next to the
+# engine under test.  AB_BASELINE must point at the reference engine.c.
+ifeq ($(strip $(AB_BASELINE)),)
+.PHONY: $(AB_REF)
+$(AB_REF):
+	@echo "AB_BASELINE=<path to the reference engine.c> is required"; exit 1
+else
+$(AB_REF): $(AB_BASELINE)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -include bench/engine_v2_rename.h -c $< -o $@
+endif
+
+$(AB): bench/engine_ab.c $(LIB) $(AB_REF)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $< $(AB_REF) $(LIB) $(LDFLAGS) -o $@
+
+ab: $(AB)
+
+ab-run: $(AB)
+	@mkdir -p $(ROOT)/run $(ROOT)/tmp
+	XDG_RUNTIME_DIR=$(ROOT)/run TMPDIR=$(ROOT)/tmp $(AB)
 
 test: $(TESTS)
 	@mkdir -p $(ROOT)/run $(ROOT)/tmp
