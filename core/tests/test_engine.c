@@ -18,16 +18,17 @@
 struct capture {
     struct rte_mbuf *m[CAP_MAX];
     int slot[CAP_MAX];
+    int worker[CAP_MAX];
     int n;
 };
 
 static void capture_tx(void *arg, int worker, int slot, struct rte_mbuf *m)
 {
     struct capture *c = arg;
-    (void)worker;
     if (c->n < CAP_MAX) {
         c->m[c->n] = m;
         c->slot[c->n] = slot;
+        c->worker[c->n] = worker;
         c->n++;
     } else {
         rte_pktmbuf_free(m);
@@ -1824,6 +1825,176 @@ static int test_ping(struct rte_mempool *mp, struct capture *cap)
     return 0;
 }
 
+/* IPv6 ping through the data plane, following the real wire sequence: the
+ * neighbour is unknown, so the router sends an NS; the host answers with an NA;
+ * the queued echo request is flushed; the echo reply comes back.  This covers
+ * the control-plane transmit path, the NS/NA handling and the receive path for
+ * a global (non-link-local) destination. */
+static uint16_t icmp6_checksum(const struct in6_addr *src,
+                               const struct in6_addr *dst,
+                               const uint8_t *icmp, uint32_t len)
+{
+    uint32_t sum = 0;
+
+    sum = csum_add(sum, (const uint8_t *)src, 16);
+    sum = csum_add(sum, (const uint8_t *)dst, 16);
+    sum += len;
+    sum += 58;
+    sum = csum_add(sum, icmp, len);
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+struct ping6_arg {
+    struct tr_engine *e;
+    struct rte_mempool *mp;
+    struct capture *cap;
+    int slot;
+    const uint8_t *peer_mac;
+};
+
+/* Find the first transmitted frame of the given ICMPv6 type in the capture. */
+static struct rte_mbuf *find_icmp6(struct capture *cap, uint8_t type, int *out)
+{
+    for (int i = 0; i < cap->n; i++) {
+        uint8_t *p = mtod(cap->m[i]);
+        if (rte_pktmbuf_pkt_len(cap->m[i]) < 14 + 40 + 8)
+            continue;
+        if (p[12] != 0x86 || p[13] != 0xdd || p[14 + 6] != 58)
+            continue;
+        if (p[14 + 40] == type) {
+            if (out)
+                *out = i;
+            return cap->m[i];
+        }
+    }
+    return NULL;
+}
+
+static void *ping6_responder(void *arg)
+{
+    struct ping6_arg *a = arg;
+    struct in6_addr me, peer;
+    struct rte_mbuf *m;
+    uint8_t icmp[8 + 56];
+    uint16_t c;
+
+    inet_pton(AF_INET6, "2001:db8:2::1", &me);
+    inet_pton(AF_INET6, "2001:db8:2::2", &peer);
+    /* Wait for the neighbor solicitation, then answer it. */
+    for (int i = 0; i < 500 && !(m = find_icmp6(a->cap, 135, NULL)); i++)
+        usleep(1000);
+    if (!m)
+        return NULL;
+    struct rte_mbuf *na = NULL;
+    if (build_ndp_na(a->mp, mtod(m) + 6, a->peer_mac, &peer, &me, &peer,
+                     a->peer_mac, &na) == 0)
+        tr_engine_input(a->e, 0, a->slot, na);
+
+    /* The queued echo request is flushed by the NA; mirror its id/seq. */
+    for (int i = 0; i < 500 && !(m = find_icmp6(a->cap, 128, NULL)); i++)
+        usleep(1000);
+    if (!m)
+        return NULL;
+    const uint8_t *req = mtod(m) + 14 + 40;
+    memset(icmp, 0, sizeof(icmp));
+    icmp[0] = 129;
+    memcpy(icmp + 4, req + 4, 4);
+    for (size_t i = 0; i < 56; i++)
+        icmp[8 + i] = (uint8_t)(0x40 + (i & 0x3f));
+    c = icmp6_checksum(&peer, &me, icmp, sizeof(icmp));
+    icmp[2] = (uint8_t)(c >> 8);
+    icmp[3] = (uint8_t)c;
+    struct in6_addr from, to;
+    inet_pton(AF_INET6, "2001:db8:2::1", &to);
+    from = peer;
+    struct rte_mbuf *rep = build_ipv6(a->mp, mtod(m) + 6, a->peer_mac, &from,
+                                      &to, 64, 58, icmp, sizeof(icmp));
+    if (rep)
+        tr_engine_input(a->e, 0, a->slot, rep);
+    return NULL;
+}
+
+static int test_ping6(struct rte_mempool *mp, struct capture *cap)
+{
+    struct tr_config cfg, env_cfg;
+    struct tr_config_env env;
+    struct tr_engine *e;
+    char err[256];
+    const uint8_t eth0_mac[6] = {0x02, 0, 0, 0, 0, 1};
+    const uint8_t eth1_mac[6] = {0x02, 0, 0, 0, 0, 2};
+    const uint8_t peer_mac[6] = {0x02, 0, 0, 0, 0, 0xbb};
+
+    setup_config(&cfg, &env);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth0 port 0") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth0 address 192.0.2.1/24") == 0);
+    CHECK(test_apply_ok(&cfg, &env, "set interfaces ethernet eth1 port 1") == 0);
+    CHECK(test_apply_ok(&cfg, &env,
+                        "set interfaces ethernet eth1 address 2001:db8:2::1/64") == 0);
+    CHECK(set_mac(&cfg, "eth0", eth0_mac) == 0);
+    CHECK(set_mac(&cfg, "eth1", eth1_mac) == 0);
+    e = tr_engine_create(&(struct tr_engine_params){.n_ports = 2,
+                                                    .workers = 1,
+                                                    .mp = mp},
+                         err, sizeof(err));
+    CHECK(e != NULL);
+    tr_engine_set_tx(e, capture_tx, cap);
+    CHECK(tr_engine_apply(e, &cfg, err, sizeof(err)) == 0);
+    tr_engine_config_copy(e, &env_cfg);
+    int eth1 = tr_config_find_const(&env_cfg, "eth1")->slot;
+    capture_reset(cap);
+
+    struct tr_ip target;
+    CHECK(tr_ip_parse("2001:db8:2::2", &target) == 0);
+    struct ping6_arg pa = {.e = e, .mp = mp, .cap = cap, .slot = eth1,
+                           .peer_mac = peer_mac};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, ping6_responder, &pa) == 0);
+    char *out = NULL;
+    CHECK(tr_engine_ping(e, &target, NULL, NULL, 1, 1000, 56, &out) == 0);
+    pthread_join(th, NULL);
+    CHECK(out != NULL);
+    if (!strstr(out, "1 received")) {
+        fprintf(stderr, "ping6 output:\n%s\n", out);
+        CHECK(0);
+    }
+    /* The queued request must have been flushed to the resolved next hop with
+     * the router's own address as the source. */
+    struct rte_mbuf *req = find_icmp6(cap, 128, NULL);
+    CHECK(req != NULL);
+    if (req) {
+        uint8_t *p = mtod(req);
+        struct in6_addr src, dst;
+        CHECK(memcmp(p, peer_mac, 6) == 0);
+        CHECK(memcmp(p + 6, eth1_mac, 6) == 0);
+        memcpy(&src, p + 14 + 8, 16);
+        memcpy(&dst, p + 14 + 24, 16);
+        CHECK(tr_ip_is_unspecified(&(struct tr_ip){.family = TR_AF_INET6,
+                                                   .u.v6 = src}) == false);
+        struct in6_addr want;
+        inet_pton(AF_INET6, "2001:db8:2::2", &want);
+        CHECK(memcmp(&dst, &want, 16) == 0);
+    }
+    /* A frame the engine originates (the NS) is submitted with
+     * worker == e->workers: that is how the DPDK TX path tells control-plane
+     * traffic apart from worker batches.  The queued echo request is flushed
+     * from the context of the worker that processed the NA, so it keeps that
+     * worker index and travels through the worker's batch. */
+    int ns_idx = -1, req_idx = -1;
+    CHECK(find_icmp6(cap, 135, &ns_idx) != NULL);
+    CHECK(find_icmp6(cap, 128, &req_idx) != NULL);
+    if (ns_idx >= 0)
+        CHECK(cap->worker[ns_idx] == 1);
+    if (req_idx >= 0)
+        CHECK(cap->worker[req_idx] == 0);
+    free(out);
+    capture_reset(cap);
+    tr_engine_destroy(e);
+    return 0;
+}
+
 static int test_malformed(struct rte_mempool *mp, struct capture *cap)
 {
     struct tr_config cfg, env_cfg;
@@ -1920,6 +2091,7 @@ int main(void)
     rc |= test_bridge(mp, &cap);
     rc |= test_autoconf(mp, &cap);
     rc |= test_ping(mp, &cap);
+    rc |= test_ping6(mp, &cap);
     rc |= test_traceroute(mp, &cap);
     rc |= test_etherip4(mp, &cap);
     rc |= test_malformed(mp, &cap);

@@ -18,7 +18,9 @@
  *
  * With TR_AB_DROP=1 the packets are built and freed without touching an
  * engine, which measures the harness floor (packet construction plus free)
- * so engine-only costs can be derived from the totals.
+ * so engine-only costs can be derived from the totals.  With TR_AB_SINGLE=1
+ * each packet is submitted through the single-packet API instead of the
+ * 32-packet burst API (the shape used by engine_bench's "single" mode).
  *
  * Both engines process the same 64-byte IPv4 frames with an ARP-resolved next
  * hop in 32-packet bursts, exactly like engine_bench's burst mode.
@@ -177,7 +179,7 @@ static int teach_arp(struct tr_engine *e, struct rte_mempool *mp, int eth1,
 }
 
 static int run_bursts(struct tr_engine *e, int ref, struct rte_mempool *mp,
-                      int eth0, int bursts, uint64_t *cycles)
+                      int eth0, int bursts, bool single, uint64_t *cycles)
 {
     uint64_t t0 = tsc_read();
 
@@ -192,7 +194,15 @@ static int run_bursts(struct tr_engine *e, int ref, struct rte_mempool *mp,
             for (int j = 0; j < AB_BATCH; j++)
                 rte_pktmbuf_free(bufs[j]);
         } else if (ref) {
-            tr_engine_input_burst_v2(e, 0, eth0, bufs, AB_BATCH);
+            if (single) {
+                for (int j = 0; j < AB_BATCH; j++)
+                    tr_engine_input_v2(e, 0, eth0, bufs[j]);
+            } else {
+                tr_engine_input_burst_v2(e, 0, eth0, bufs, AB_BATCH);
+            }
+        } else if (single) {
+            for (int j = 0; j < AB_BATCH; j++)
+                tr_engine_input(e, 0, eth0, bufs[j]);
         } else {
             tr_engine_input_burst(e, 0, eth0, bufs, AB_BATCH);
         }
@@ -222,6 +232,7 @@ int main(void)
     int bursts = AB_BURSTS_PER_BLOCK;
     const char *e;
     bool drop_mode = getenv("TR_AB_DROP") && atoi(getenv("TR_AB_DROP")) != 0;
+    bool single = getenv("TR_AB_SINGLE") && atoi(getenv("TR_AB_SINGLE")) != 0;
     uint64_t pkts_per_variant, cyc_a_total = 0, cyc_b_total = 0;
 
     if ((e = getenv("TR_AB_BLOCKS")) && atoi(e) > 0)
@@ -309,12 +320,12 @@ int main(void)
         /* Flip the order every block so position-in-pair bias cancels. */
         int mode_b = drop_mode ? 2 : 1;
         if (r % 2 == 0) {
-            if (run_bursts(ea, 0, mp, eth0, bursts, &ca) ||
-                run_bursts(eb, mode_b, mp, eth0, bursts, &cb))
+            if (run_bursts(ea, 0, mp, eth0, bursts, single, &ca) ||
+                run_bursts(eb, mode_b, mp, eth0, bursts, single, &cb))
                 return 1;
         } else {
-            if (run_bursts(eb, mode_b, mp, eth0, bursts, &cb) ||
-                run_bursts(ea, 0, mp, eth0, bursts, &ca))
+            if (run_bursts(eb, mode_b, mp, eth0, bursts, single, &cb) ||
+                run_bursts(ea, 0, mp, eth0, bursts, single, &ca))
                 return 1;
         }
         cyc_a_total += ca;

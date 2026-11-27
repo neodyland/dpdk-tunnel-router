@@ -37,6 +37,9 @@ struct tr_dpdk {
     _Atomic int port_slot[TR_PORT_MAX];
     _Atomic int slot_port[TR_IFACE_MAX];
     int port_nq[TR_PORT_MAX];
+    /* TX queue reserved for control-plane traffic (ping, ARP/NDP, RA/RS),
+     * -1 when the PMD has no spare queue. */
+    int port_tx_ctrl_q[TR_PORT_MAX];
     _Atomic int active_ports[TR_PORT_MAX];
     _Atomic int nactive;
     bool port_tx_ipv4_cksum[TR_PORT_MAX];
@@ -82,14 +85,25 @@ static void tx_burst(void *arg, int worker, int if_slot, struct rte_mbuf *m)
         rte_pktmbuf_free(m);
         return;
     }
-    q = worker % (d->port_nq[port] > 0 ? d->port_nq[port] : 1);
-    if (!atomic_load_explicit(&d->workers_running, memory_order_relaxed)) {
+    if (worker < 0 || worker >= d->workers) {
+        /* Control-plane transmission from the main lcore: ping, ARP/NDP,
+         * RA/RS and ICMP errors.  The engine signals it with worker ==
+         * e->workers, which is outside the worker range.  These frames are
+         * sent immediately on the port's reserved control queue, because a
+         * DPDK TX queue must not be driven by two threads and the workers own
+         * queues 0..port_nq-1.  PMDs without a spare queue fall back to queue
+         * 0, which is what the single-queue code did before batching. */
+        q = d->port_tx_ctrl_q[port];
+        if (q < 0)
+            q = 0;
         if (rte_eth_tx_burst((uint16_t)port, (uint16_t)q, &m, 1) != 1)
             rte_pktmbuf_free(m);
         return;
     }
-    if (worker < 0 || worker >= d->workers) {
-        rte_pktmbuf_free(m);
+    q = worker % (d->port_nq[port] > 0 ? d->port_nq[port] : 1);
+    if (!atomic_load_explicit(&d->workers_running, memory_order_relaxed)) {
+        if (rte_eth_tx_burst((uint16_t)port, (uint16_t)q, &m, 1) != 1)
+            rte_pktmbuf_free(m);
         return;
     }
     struct tr_tx_batch *b = &d->tx[worker][port];
@@ -215,7 +229,24 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
         d->port_tx_ipv4_cksum[port] = false;
     }
 
-    ret = rte_eth_dev_configure(port, nq, nq, &conf);
+    /* One extra TX queue for control-plane traffic when the PMD allows it:
+     * the main lcore sends ping/ARP/NDP frames while the workers drive their
+     * own queues, and a DPDK TX queue is single-producer. */
+    uint16_t nq_tx = nq;
+    int ctrl_q = -1;
+    if (info.max_tx_queues > nq) {
+        nq_tx = (uint16_t)(nq + 1);
+        ctrl_q = (int)nq;
+    }
+
+    ret = rte_eth_dev_configure(port, nq, nq_tx, &conf);
+    if (ret != 0 && ctrl_q >= 0) {
+        /* The PMD accepted fewer TX queues than advertised; drop the
+         * reserved queue and share a worker queue for control traffic. */
+        nq_tx = nq;
+        ctrl_q = -1;
+        ret = rte_eth_dev_configure(port, nq, nq_tx, &conf);
+    }
     if (ret != 0) {
         /* Some PMDs advertise jumbo support but reject an MTU at configure
          * time, and some accept multiple queues but not RSS.  Retry with a
@@ -226,14 +257,17 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
         conf.rxmode.offloads = 0;
         conf.txmode.offloads = 0;
         d->port_tx_ipv4_cksum[port] = false;
-        ret = rte_eth_dev_configure(port, nq, nq, &conf);
+        nq_tx = nq;
+        ctrl_q = -1;
+        ret = rte_eth_dev_configure(port, nq, nq_tx, &conf);
         if (ret != 0 && nq > 1) {
             nq = 1;
+            nq_tx = 1;
             d->port_nq[port] = 1;
             fprintf(stderr,
                     "port %u: multi-queue configure failed; using 1 queue\n",
                     port);
-            ret = rte_eth_dev_configure(port, nq, nq, &conf);
+            ret = rte_eth_dev_configure(port, nq, nq_tx, &conf);
         }
         if (ret != 0) {
             snprintf(err, errlen, "port %u: configure failed: %s", port,
@@ -256,10 +290,11 @@ static int configure_port(struct tr_dpdk *d, uint16_t port, uint32_t mtu,
             return -1;
         }
     }
+    d->port_tx_ctrl_q[port] = ctrl_q;
     memset(&txq, 0, sizeof(txq));
     txq = info.default_txconf;
     txq.offloads = 0;
-    for (uint16_t q = 0; q < nq; q++) {
+    for (uint16_t q = 0; q < nq_tx; q++) {
         if (rte_eth_tx_queue_setup(port, q, tx_desc,
                                    (unsigned int)socket, &txq) != 0) {
             snprintf(err, errlen, "port %u: TX queue %u setup failed", port,
@@ -300,8 +335,10 @@ struct tr_dpdk *tr_dpdk_create(struct tr_engine *engine,
         d->nports = TR_PORT_MAX;
     atomic_store(&d->stop, false);
     atomic_store(&d->workers_running, false);
-    for (int i = 0; i < TR_PORT_MAX; i++)
+    for (int i = 0; i < TR_PORT_MAX; i++) {
         atomic_store(&d->port_slot[i], -1);
+        d->port_tx_ctrl_q[i] = -1;
+    }
     for (int i = 0; i < TR_IFACE_MAX; i++)
         atomic_store(&d->slot_port[i], -1);
     if (tr_engine_config_copy(engine, &cfg))

@@ -168,8 +168,26 @@ ctl show interfaces | grep -q '203.0.113.1/24' || {
 }
 
 # Data-plane ping and the enhanced neighbor/MAC table.
+#
+# ping, ARP/NDP and RA/RS frames are generated on the main lcore, not on a
+# worker, so make sure they actually reach the PMD: net_null cannot answer,
+# but the port's TX counter has to advance.
+pmd_tx() {
+    ctl show status | sed -n 's/^port [0-9]* if[0-9]*: rx [0-9]* tx \([0-9]*\).*/\1/p' | head -1
+}
+tx_before=$(pmd_tx)
 ping_out=$(ctl ping 203.0.113.254 count 1 timeout 100)
+tx_after=$(pmd_tx)
 expect_contains "$ping_out" "packets transmitted" "ping statistics"
+if [[ -z "$tx_before" || -z "$tx_after" ]]; then
+    echo "smoke: cannot read PMD tx counters" >&2
+    exit 1
+fi
+if (( tx_after <= tx_before )); then
+    echo "smoke: control-plane frame did not reach the PMD " \
+         "(tx $tx_before -> $tx_after)" >&2
+    exit 1
+fi
 trace_out=$(ctl traceroute 203.0.113.254 max-hops 1 probes 1 timeout 100)
 expect_contains "$trace_out" "traceroute to" "traceroute output"
 expect_contains "$trace_out" "Trace stopped at max hops." "traceroute max hops"
